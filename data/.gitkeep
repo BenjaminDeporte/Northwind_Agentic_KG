@@ -1,0 +1,2 @@
+# This file ensures the data directory is tracked by git
+# Place your Northwind CSV files here for Neo4j database creation

@@ -1,0 +1,79 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "Northwind_Agentic_KG"
+version = "0.1.0"
+description = "A chatbot application powered by LangGraph agents, Neo4j Aura (Northwind dataset), and Streamlit UI"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Benjamin Deporte", email = "benjamin.deporte@example.com"}
+]
+keywords = [
+    "neo4j",
+    "langgraph",
+    "streamlit",
+    "knowledge-graph",
+    "agentic",
+    "northwind",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+dependencies = [
+    "langgraph>=0.0.10",
+    "neo4j>=5.12.0",
+    "streamlit>=1.29.0",
+    "python-dotenv>=1.0.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.5.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    "black>=23.10.0",
+    "isort>=5.12.0",
+    "flake8>=6.1.0",
+    "mypy>=1.7.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/your-org/Northwind_Agentic_KG"
+Documentation = "https://github.com/your-org/Northwind_Agentic_KG#readme"
+Repository = "https://github.com/your-org/Northwind_Agentic_KG.git"
+Issues = "https://github.com/your-org/Northwind_Agentic_KG/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310", "py311", "py312"]
+
+[tool.isort]
+profile = "black"
+line_length = 100
+
+[tool.pytest.ini_options]
+python_files = "test_*.py"
+testpaths = ["tests"]
+addopts = "-v --cov=src --cov-report=term-missing"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
