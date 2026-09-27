@@ -277,7 +277,7 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
     
     # ===== Supplier impact (depth 3, out) =====
     # Pattern: Supplier -[:SUPPLIES]-> Product <-[:ORDERS]- Order <-[:PURCHASED]- Customer
-    # Subgraph only includes SUPPLIES and ORDERS edges (PURCHASED is traversed but not counted)
+    # Subgraph includes SUPPLIES, ORDERS, and PURCHASED edges (all distinct node pairs)
     if entity_label == "Supplier" and direction == "out" and depth == 3:
         query = f"""
         MATCH (s:Supplier {{{key_prop}: $entity_key}})-[:SUPPLIES]->(p:Product)<-[line:ORDERS]-(o:Order)<-[:PURCHASED]-(c:Customer)
@@ -318,6 +318,12 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                 "country": ""
             }
             
+            # For distinct edge counting per contract rule:
+            # "edges count distinct node pairs, not traversal instances"
+            order_product_pairs = set()  # (order_key, product_key) for ORDERS
+            customer_order_pairs = set()  # (customer_key, order_key) for PURCHASED
+            supplier_product_pairs = set()  # (supplier_key, product_key) for SUPPLIES
+            
             for record in records:
                 # Anchor (only once)
                 if anchor["name"] == "":
@@ -325,12 +331,24 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                     anchor["country"] = str(record.get("s_country", ""))
                 
                 # Collect unique nodes
-                if record.get("p_key"):
-                    products.add(str(record["p_key"]))
-                if record.get("o_key"):
-                    orders.add(str(record["o_key"]))
-                if record.get("c_key"):
-                    customers.add(str(record["c_key"]))
+                p_key = str(record.get("p_key", "")) if record.get("p_key") else ""
+                o_key = str(record.get("o_key", "")) if record.get("o_key") else ""
+                c_key = str(record.get("c_key", "")) if record.get("c_key") else ""
+                s_key = entity_key
+                
+                if p_key:
+                    products.add(p_key)
+                    supplier_product_pairs.add((s_key, p_key))
+                if o_key:
+                    orders.add(o_key)
+                if c_key:
+                    customers.add(c_key)
+                
+                # Track distinct pairs for edges
+                if o_key and p_key:
+                    order_product_pairs.add((o_key, p_key))
+                if c_key and o_key:
+                    customer_order_pairs.add((c_key, o_key))
                 
                 # Revenue calculation: coalesce(line.unitPrice, p.unitPrice) * line.quantity
                 line_unitPrice = record.get("line_unitPrice")
@@ -345,12 +363,15 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                     total_revenue += float(p_unitPrice) * float(line_quantity)
             
             # Edge counts for subgraph
-            # SUPPLIES: one per product (from supplier to product)
-            # ORDERS: one per record (each record represents one ORDERS relationship)
-            # PURCHASED: NOT included in subgraph edges (traversed but not counted)
+            # Contract rule: edges count DISTINCT node pairs, not traversal instances
+            # SUPPLIES: distinct (Supplier, Product) pairs = 3
+            # ORDERS: distinct (Order, Product) pairs = 94 (each order line is unique)
+            # PURCHASED: distinct (Customer, Order) pairs = 90
+            # Note: 94 ORDERS vs 90 PURCHASED because 4 orders buy 2 supplier products each
             edge_counts = {
-                "SUPPLIES": len(products),
-                "ORDERS": len(records)
+                "SUPPLIES": len(supplier_product_pairs),
+                "ORDERS": len(order_product_pairs),
+                "PURCHASED": len(customer_order_pairs)
             }
             
             # Node counts for subgraph

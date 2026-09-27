@@ -162,7 +162,7 @@ Identical to 1.1.5 — verified that no other label has an entity named "Chai"; 
 
 Cross-checks passed (corrected 2026-09-27 after coding-agent challenge, re-verified live): output-6 distinct orders (90) = orders_affected; 94 order lines total (Chai 38 + Chang 44 + Aniseed Syrup 12 — the original consolidation said 91, which was an error); 4 orders bought two of the three supplier products (10485, 10611, 11070, 11077 → 94 lines − 4 duplicates = 90 orders); revenue recomputed from all 94 lines = 35,916.80 to the cent (live recheck: count(*)=94, count(DISTINCT o)=90, revenue 35916.8).
 
-Open contract decision (do not let the implementation settle it silently): the subgraph node list includes Customer (49), but the edge set below counts only SUPPLIES + ORDERS — the 90 PURCHASED edges connecting the customers are omitted, which renders customers as orphan nodes in the agraph panel. Either add `"PURCHASED": 90` to edges, or document in PROJECT.md why the evidence-subgraph edge set is restricted to the traversal path that produced the impact aggregates.
+Contract decision (final, 2026-09-27): Final edge set `{SUPPLIES: 3, ORDERS: 94, PURCHASED: 90}`. Contract rule: edges count distinct node pairs, not traversal instances. The 94-vs-90 asymmetry exists because 4 orders buy 2 supplier products each, creating 94 distinct (Order, Product) pairs via ORDERS edges but only 90 distinct (Customer, Order) pairs via PURCHASED edges (verified: count(DISTINCT [orderID, customerID]) = 90, distinct customers = 49). Fully connected subgraph: no orphan customer nodes in Phase 3 render.
 
 The coalesce rule does real work here: Chai lines carry two prices — 14.4 (line-level unitPrice, early orders) and 18.0 (product-price fallback). Both sources verified inside the single revenue figure.
 
@@ -172,7 +172,7 @@ The coalesce rule does real work here: Chai lines carry two prices — 14.4 (lin
   "anchor": { "label": "Supplier", "key": "1", "name": "Exotic Liquids", "country": "UK" },
   "subgraph": {
     "nodes": { "Supplier": 1, "Product": 3, "Order": 90, "Customer": 49 },
-    "edges": { "SUPPLIES": 3, "ORDERS": 94 }
+    "edges": { "SUPPLIES": 3, "ORDERS": 94, "PURCHASED": 90 }
   },
   "aggregates": {
     "products_affected": 3,

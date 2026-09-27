@@ -18,7 +18,7 @@ GT_1_2_1 = {
     "anchor": {"label": "Supplier", "key": "1", "name": "Exotic Liquids", "country": "UK"},
     "subgraph": {
         "nodes": {"Supplier": 1, "Product": 3, "Order": 90, "Customer": 49},
-        "edges": {"SUPPLIES": 3, "ORDERS": 94}
+        "edges": {"SUPPLIES": 3, "ORDERS": 94, "PURCHASED": 90}
     },
     "aggregates": {
         "products_affected": 3,
