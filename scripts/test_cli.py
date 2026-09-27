@@ -272,11 +272,9 @@ def main():
     
     # Build and compile the ACTUAL LangGraph
     print("\nBuilding and compiling LangGraph...")
-    graph = build_graph(tools)
     compiled_graph = compile_graph(tools)
     print("LangGraph compiled successfully!")
     print("\nGraph structure:")
-    print(f"  Entry point: classify")
     print(f"  Nodes: {list(compiled_graph.nodes.keys())}")
     print("-" * 80)
     
