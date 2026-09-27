@@ -10,7 +10,12 @@ Authoritative contracts:
 
 import os
 from typing import Any
-from mistralai import Mistral
+
+# Handle different mistralai package versions
+try:
+    from mistralai import Mistral
+except ImportError:
+    from mistralai.client import Mistral
 
 
 # =============================================================================

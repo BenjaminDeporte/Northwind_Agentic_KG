@@ -153,6 +153,7 @@ def run_graph_on_question(question: str, graph) -> AgentState:
         'route': '',
         'messages': [],
         'trace': [],
+        'tool_results': {},
         'answer': '',
         'citations': [],
         'confidence': 0.0,
