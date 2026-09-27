@@ -79,6 +79,10 @@ def classify(state: AgentState) -> AgentState:
     IMPLEMENTATION:
     Uses Mistral small model per PROJECT.md: "Mistral models: small for classify"
     Falls back to deterministic regex if LLM is unavailable (for testing without API).
+    
+    TRANSPARENCY REQUIREMENT:
+    When fallback is used, it MUST be disclosed in the run-log via error field.
+    This demo is about trust - degraded routing must be visible to users.
     """
     question = state.get('question', '')
     
@@ -107,7 +111,15 @@ def classify(state: AgentState) -> AgentState:
     except (ValueError, ImportError, Exception) as e:
         # Fallback to deterministic regex for Phase 2 testing
         # This maintains backward compatibility with existing tests
-        return _classify_with_regex(state)
+        # BUT: We MUST disclose this fallback for transparency
+        result = _classify_with_regex(state)
+        
+        # Add error to disclose degraded routing
+        # This will appear in run-log for transparency
+        return {
+            **result,
+            'error': f'classify: LLM unavailable, using regex fallback. Original error: {str(e)[:200]}'
+        }
 
 
 def _classify_with_regex(state: AgentState) -> AgentState:
@@ -343,7 +355,14 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
         return _agent_with_llm(state, tools, new_loop_count)
     except (ValueError, ImportError, Exception) as e:
         # Fallback to deterministic tool selection for Phase 2 testing
-        return _agent_with_deterministic(state, tools, new_loop_count)
+        # BUT: We MUST disclose this fallback for transparency
+        result = _agent_with_deterministic(state, tools, new_loop_count)
+        
+        # Add error to disclose degraded routing if not already set
+        if not result.get('error'):
+            result['error'] = f'agent: LLM unavailable, using deterministic fallback. Original error: {str(e)[:200]}'
+        
+        return result
 
 
 def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
