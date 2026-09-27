@@ -18,6 +18,12 @@ Control-flow invariants verified:
 - Budget exhaustion routes to degrade, never to synthesize
 - Every executed tool call appends exactly one ToolCallRecord
 - No silent tool calls
+
+IMPLEMENTATION NOTE:
+This test uses the ACTUAL compiled LangGraph from src/agents/graph.py.
+It does NOT simulate or script the execution path manually.
+Each question flows through: classify → agent ↔ tools → synthesize/degrade
+with the LIVE LLM driving tool selection.
 """
 
 import os
@@ -32,7 +38,6 @@ sys.path.insert(0, src_path)
 
 # Now import everything properly
 from src.agents.state import AgentState, ROUTE_AGENT, ROUTE_CHITCHAT, ROUTE_REFUSAL, ROUTE_DEGRADE
-from src.agents.nodes import classify, agent, synthesize, degrade, tools_dispatcher
 from src.agents.graph import build_graph, compile_graph
 from src.neo4j.tools import (
     lookup_entity,
@@ -42,6 +47,7 @@ from src.neo4j.tools import (
     aggregate,
     run_readonly_cypher,
 )
+from src.utils.runlog import write_run
 
 
 # =============================================================================
@@ -124,14 +130,23 @@ def get_tools_dict() -> dict:
     }
 
 
-def run_full_pipeline(question: str) -> AgentState:
+def run_graph_on_question(question: str, graph) -> AgentState:
     """
-    Run the full agent pipeline: classify -> agent -> synthesize/degrade
+    Run the compiled LangGraph on a single question.
     
-    This simulates the LangGraph execution path.
+    This is the ACTUAL graph execution, not a manual simulation.
+    The graph handles:
+    - classify → routes to agent/chitchat/refusal
+    - agent → ReAct loop with MAX_STEPS=8, calls tools via tools_dispatcher
+    - agent → synthesize (when answer ready) or degrade (on budget exhaustion)
+    
+    Args:
+        question: The user's question
+        graph: The compiled LangGraph
+    
+    Returns:
+        Final AgentState after graph execution
     """
-    tools = get_tools_dict()
-    
     # Initialize state
     state: AgentState = {
         'question': question,
@@ -146,54 +161,10 @@ def run_full_pipeline(question: str) -> AgentState:
         'error': None,
     }
     
-    # Step 1: Classify
-    state = classify(state)
-    route = state.get('route', '')
+    # Invoke the compiled graph
+    final_state = graph.invoke(state)
     
-    # Step 2: Route to appropriate handler
-    if route == ROUTE_CHITCHAT or route == ROUTE_REFUSAL:
-        # Classify already set answer for these
-        return state
-    
-    elif route == ROUTE_AGENT:
-        # Run agent loop
-        max_iterations = 10  # Safety limit
-        prev_trace_length = 0
-        for _ in range(max_iterations):
-            prev_trace_length = len(state.get('trace', []))
-            old_route = state.get('route', '')
-            state = agent(state, tools)
-            
-            new_route = state.get('route', '')
-            
-            # Check if we need to degrade
-            if new_route == ROUTE_DEGRADE:
-                state = degrade(state)
-                break
-            
-            # Check if agent has an answer
-            if state.get('answer'):
-                break
-            
-            # Check if no more tools to call (loop ended)
-            if state.get('loop_count', 0) >= 8:
-                state = degrade(state)
-                break
-            
-            # Prevent infinite loop - check if progress was made
-            # Progress = trace grew or answer was set
-            if new_route == old_route and not state.get('answer') and len(state.get('trace', [])) <= prev_trace_length:
-                # Agent didn't make progress (no new tool calls)
-                break
-        
-        # Step 3: Synthesize if we have a route of agent
-        if state.get('route') == ROUTE_AGENT:
-            state = synthesize(state)
-        
-        return state
-    
-    else:
-        return state
+    return final_state
 
 
 def verify_state(state: AgentState, expected_route: str, min_confidence: float) -> tuple[bool, list[str]]:
@@ -246,9 +217,9 @@ def print_result(question_id: str, question: str, state: AgentState, passed: boo
     confidence = state.get('confidence', 0.0)
     answer = state.get('answer', '')[:100] + "..." if len(state.get('answer', '')) > 100 else state.get('answer', '')
     
-    status = "✓ PASS" if passed else "✗ FAIL"
+    status = "PASS" if passed else "FAIL"
     
-    print(f"\n{status} | {question_id}")
+    print(f"\n[{status}] | {question_id}")
     print(f"  Question: {question}")
     print(f"  Route: {route}")
     print(f"  Confidence: {confidence:.2f}")
@@ -265,6 +236,10 @@ def print_result(question_id: str, question: str, state: AgentState, passed: boo
         print(f"  Trace: {len(trace)} tool calls")
         for record in trace:
             print(f"    Step {record['step']}: {record['tool_name']} ({record['status']})")
+    
+    # Print any error
+    if state.get('error'):
+        print(f"  Error: {state['error']}")
 
 
 # =============================================================================
@@ -272,11 +247,11 @@ def print_result(question_id: str, question: str, state: AgentState, passed: boo
 # =============================================================================
 
 def main():
-    """Run all scripted questions through the pipeline."""
+    """Run all scripted questions through the ACTUAL compiled LangGraph."""
     print("=" * 80)
     print("GATE 1: END-TO-END CLI TEST")
     print("=" * 80)
-    print("\nTesting agent pipeline with live LLM calls...")
+    print("\nTesting agent pipeline with live LLM calls through compiled LangGraph...")
     print("Note: This test requires MISTRAL_API_KEY and NEO4J_URI/NEO4J_PASSWORD")
     print("=" * 80)
     
@@ -285,28 +260,41 @@ def main():
     missing = [v for v in required_vars if not os.getenv(v)]
     
     if missing:
-        print(f"\n✗ FAIL: Missing required environment variables: {', '.join(missing)}")
+        print(f"\nFAIL: Missing required environment variables: {', '.join(missing)}")
         print("\nSet them in .env file or export them before running this script.")
         sys.exit(1)
     
     print("\nAll required environment variables are set.")
     print("-" * 80)
     
-    # Run tests
+    # Get tools
+    tools = get_tools_dict()
+    
+    # Build and compile the ACTUAL LangGraph
+    print("\nBuilding and compiling LangGraph...")
+    graph = build_graph(tools)
+    compiled_graph = compile_graph(tools)
+    print("LangGraph compiled successfully!")
+    print("\nGraph structure:")
+    print(f"  Entry point: classify")
+    print(f"  Nodes: {list(compiled_graph.nodes.keys())}")
+    print("-" * 80)
+    
+    # Run tests through the ACTUAL compiled graph
     results = []
     for q in SCRIPTED_QUESTIONS:
         try:
             print(f"\n[{q['id']}] Testing: {q['description']}")
-            state = run_full_pipeline(q['question'])
+            state = run_graph_on_question(q['question'], compiled_graph)
             passed, errors = verify_state(state, q['expected_route'], q['min_confidence'])
             print_result(q['id'], q['question'], state, passed, errors)
-            results.append({'id': q['id'], 'passed': passed, 'errors': errors})
+            results.append({'id': q['id'], 'passed': passed, 'errors': errors, 'state': state})
         except Exception as e:
-            print(f"\n✗ FAIL | {q['id']}")
+            print(f"\nFAIL | {q['id']}")
             print(f"  Exception: {e}")
             import traceback
             traceback.print_exc()
-            results.append({'id': q['id'], 'passed': False, 'errors': [str(e)]})
+            results.append({'id': q['id'], 'passed': False, 'errors': [str(e)], 'state': {}})
     
     # Summary
     print("\n" + "=" * 80)
@@ -328,11 +316,11 @@ def main():
     print("\n" + "=" * 80)
     
     if failed == 0:
-        print("✓ GATE 1 PASSED: All scripted questions answered correctly!")
+        print("GATE 1 PASSED: All scripted questions answered correctly!")
         print("The demo cannot fail.")
         sys.exit(0)
     else:
-        print("✗ GATE 1 FAILED: Some questions did not pass.")
+        print("GATE 1 FAILED: Some questions did not pass.")
         sys.exit(1)
 
 

@@ -2,7 +2,7 @@
 LangGraph graph definition for the Northwind Agentic KG.
 
 Authoritative contracts:
-- PROJECT.md §2: Architecture (classify → agent ↔ tools → synthesize; agent → degrade)
+- PROJECT.md §2: Architecture (classify → agent ↔ tools → synthesize, degrade)
 - PLAN.md 2.8: LangGraph graph definition
 
 Control-flow invariants:
@@ -12,11 +12,12 @@ Control-flow invariants:
 - No silent calls
 
 Graph structure:
-    classify → agent ↔ tools → synthesize
-                   agent → degrade (on budget exhaustion)
+    classify → agent ↔ agent → synthesize
+    classify → END (for chitchat/refusal)
+    agent → degrade (on budget exhaustion)
 """
 
-from typing import Callable, Any
+from typing import Callable, Any, Literal
 from langgraph.graph import StateGraph, END
 
 from .state import AgentState, ROUTE_AGENT, ROUTE_CHITCHAT, ROUTE_REFUSAL, ROUTE_DEGRADE, MAX_STEPS
@@ -24,33 +25,40 @@ from .nodes import classify, agent, synthesize, degrade
 
 
 # =============================================================================
-# HELPER FUNCTIONS
+# CONDITION FUNCTIONS
 # =============================================================================
 
-def should_route_to_agent(state: AgentState) -> bool:
-    """Check if classify should route to agent."""
-    return state.get('route') == ROUTE_AGENT
-
-
-def should_route_to_end_for_chitchat_refusal(state: AgentState) -> bool:
-    """Check if classify should route to END for chitchat/refusal."""
-    return state.get('route') in (ROUTE_CHITCHAT, ROUTE_REFUSAL)
-
-
-def should_synthesize(state: AgentState) -> bool:
-    """Check if we should synthesize the answer."""
+def route_from_classify(state: AgentState) -> Literal["agent", END]:
+    """Route from classify to agent or END."""
     route = state.get('route', '')
-    return (
-        route == ROUTE_AGENT and 
-        state.get('answer') is not None and
-        len(state.get('trace', [])) > 0
-    )
+    if route == ROUTE_AGENT:
+        return "agent"
+    elif route in (ROUTE_CHITCHAT, ROUTE_REFUSAL):
+        return END
+    else:
+        # Default to agent if route not set yet
+        return "agent"
 
 
-def should_degrade(state: AgentState) -> bool:
-    """Check if we should route to degrade."""
+def route_from_agent(state: AgentState) -> Literal["agent", "synthesize", "degrade"]:
+    """
+    Route from agent to next node.
+    
+    Priority:
+    1. degrade - if budget exhausted (loop_count >= MAX_STEPS)
+    2. synthesize - if we have an answer
+    3. agent - continue looping
+    """
     loop_count = state.get('loop_count', 0)
-    return loop_count >= MAX_STEPS
+    route = state.get('route', '')
+    has_answer = state.get('answer') is not None and bool(state.get('answer', '').strip())
+    
+    if loop_count >= MAX_STEPS:
+        return "degrade"
+    elif has_answer:
+        return "synthesize"
+    else:
+        return "agent"
 
 
 # =============================================================================
@@ -64,12 +72,13 @@ def build_graph(tools: dict[str, Callable]) -> StateGraph[AgentState]:
     Contract: PROJECT.md §2, PLAN.md 2.8
     
     Graph structure:
-        classify → agent ↔ tools → synthesize
-                       agent → degrade (on budget exhaustion)
+        classify → agent → agent → ... → synthesize
+                   → degrade (on budget exhaustion)
+        classify → END (for chitchat/refusal)
     
     Nodes:
     - classify: Small LLM router (agent | chitchat | refusal)
-    - agent: ReAct loop with MAX_STEPS=8
+    - agent: ReAct loop with MAX_STEPS=8 (one tool call per iteration)
     - synthesize: Produces final answer with citations and confidence
     - degrade: Budget exhaustion handler with 0.4 confidence cap
     
@@ -79,9 +88,8 @@ def build_graph(tools: dict[str, Callable]) -> StateGraph[AgentState]:
     - Budget exhaustion always routes to degrade, never to synthesize
     - No silent tool calls
     
-    Note: In this implementation, the agent node handles tool calling internally
-    via tools_dispatcher, so we don't need a separate tools node in the graph.
-    The tools are passed to the agent node.
+    The agent node handles ONE iteration of the ReAct loop per invocation.
+    The graph's edges control the looping behavior.
     
     Args:
         tools: Dictionary mapping tool names to tool functions
@@ -95,14 +103,11 @@ def build_graph(tools: dict[str, Callable]) -> StateGraph[AgentState]:
     # =========================================================================
     # NODE 1: classify
     # =========================================================================
-    # Routes the question to agent, chitchat, or refusal
     workflow.add_node("classify", classify)
     
     # =========================================================================
-    # NODE 2: agent (ReAct loop)
+    # NODE 2: agent (ReAct loop - one iteration per call)
     # =========================================================================
-    # The agent performs the ReAct loop with MAX_STEPS=8
-    # It handles tool calling internally via tools_dispatcher
     def agent_node(state: AgentState) -> AgentState:
         """Wrapper for agent node with tool binding."""
         return agent(state, tools)
@@ -122,41 +127,18 @@ def build_graph(tools: dict[str, Callable]) -> StateGraph[AgentState]:
     # =========================================================================
     # EDGES FROM classify
     # =========================================================================
-    
-    # classify → agent (for agent route)
     workflow.add_conditional_edges(
         "classify",
-        should_route_to_agent,
-        "agent",
-    )
-    
-    # classify → END (for chitchat and refusal routes - they already have answer set)
-    workflow.add_conditional_edges(
-        "classify",
-        should_route_to_end_for_chitchat_refusal,
-        END,
+        route_from_classify,
     )
     
     # =========================================================================
     # EDGES FROM agent
     # =========================================================================
-    
-    # agent → synthesize (when answer is ready)
     workflow.add_conditional_edges(
         "agent",
-        should_synthesize,
-        "synthesize",
+        route_from_agent,
     )
-    
-    # agent → degrade (on budget exhaustion)
-    workflow.add_conditional_edges(
-        "agent",
-        should_degrade,
-        "degrade",
-    )
-    
-    # agent → agent (continue loop - default when no other condition matches)
-    workflow.add_edge("agent", "agent")
     
     # =========================================================================
     # TERMINAL EDGES

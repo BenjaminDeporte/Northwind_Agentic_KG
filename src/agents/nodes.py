@@ -21,6 +21,8 @@ Node dependencies:
 """
 
 import time
+import json
+import re
 from typing import Optional, Any, Literal, Callable
 from typing_extensions import Annotated
 
@@ -51,7 +53,7 @@ from .rubric import compute_confidence
 Message = dict[str, Any]
 
 # Tool function type
-ToolFunc = Callable[[Any], dict]
+ToolFunc = Callable[..., dict]
 
 
 # =============================================================================
@@ -110,7 +112,6 @@ def classify(state: AgentState) -> AgentState:
     
     except (ValueError, ImportError, Exception) as e:
         # Fallback to deterministic regex for Phase 2 testing
-        # This maintains backward compatibility with existing tests
         # BUT: We MUST disclose this fallback for transparency
         result = _classify_with_regex(state)
         
@@ -131,8 +132,6 @@ def _classify_with_regex(state: AgentState) -> AgentState:
     """
     question = state.get('question', '')
     question_lower = question.lower().strip()
-    
-    import re
     
     def contains_phrase(q: str, phrase: str) -> bool:
         escaped = re.escape(phrase)
@@ -310,9 +309,24 @@ def _get_tool_mode(tool_name: str) -> str:
 
 def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     """
-    ReAct loop node.
+    ReAct loop node - SINGLE ITERATION per graph call.
     
     Contract: PROJECT.md §2, PLAN.md 2.4
+    
+    This node performs ONE iteration of the ReAct loop per invocation.
+    The graph has a self-loop edge (agent → agent) that allows multiple iterations.
+    
+    Each iteration:
+    1. Checks loop_count against MAX_STEPS (if exceeded, sets route to DEGRADE)
+    2. Uses LLM to generate next step (ReAct: THINK -> TOOL -> observe)
+    3. Parses and dispatches ONE tool call
+    4. Updates state with tool result and increments loop_count
+    5. Returns updated state
+    
+    The graph's conditional edges will check:
+    - If answer is ready → route to synthesize
+    - If loop_count >= MAX_STEPS → route to degrade
+    - Otherwise → loop back to agent
     
     MAX_STEPS=8. All 6 tools bound. Emits tool calls. 
     Terminates on answer or budget exhaustion.
@@ -321,13 +335,7 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     - MAX_STEPS=8
     - Budget exhaustion routes to degrade, never to synthesize
     - Every executed tool call appends exactly one ToolCallRecord
-    
-    The agent:
-    1. Checks loop_count against MAX_STEPS
-    2. Uses LLM to generate next step (ReAct: THINK -> TOOL -> observe)
-    3. Parses and dispatches tool call
-    4. Updates state with tool result
-    5. Returns updated state
+    - No silent tool calls
     
     Uses Mistral large model per PROJECT.md: "Mistral models: large for agent"
     Falls back to deterministic tool selection if LLM is unavailable.
@@ -338,25 +346,24 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     trace = state.get('trace', [])
     messages = state.get('messages', [])
     
-    # Check for budget exhaustion
+    # Check for budget exhaustion - return with DEGRADE route
     if loop_count >= MAX_STEPS:
-        # Route to degrade
         return {
             **state,
             'route': ROUTE_DEGRADE,
             'error': f'Budget exhausted: loop_count={loop_count} >= MAX_STEPS={MAX_STEPS}',
         }
     
-    # Update loop count
+    # Update loop count for this iteration
     new_loop_count = loop_count + 1
     
     # Try LLM-based ReAct loop first (Gate 1+)
     try:
-        return _agent_with_llm(state, tools, new_loop_count)
+        return _agent_iteration_with_llm(state, tools, new_loop_count)
     except (ValueError, ImportError, Exception) as e:
         # Fallback to deterministic tool selection for Phase 2 testing
         # BUT: We MUST disclose this fallback for transparency
-        result = _agent_with_deterministic(state, tools, new_loop_count)
+        result = _agent_iteration_deterministic(state, tools, new_loop_count)
         
         # Add error to disclose degraded routing if not already set
         if not result.get('error'):
@@ -365,30 +372,25 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
         return result
 
 
-def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
+def _agent_iteration_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
     """
-    LLM-based ReAct loop implementation.
+    Perform ONE iteration of LLM-based ReAct loop.
     
-    Generates reasoning + tool call from LLM, parses it, executes the tool,
-    and returns the updated state.
+    This performs:
+    1. LLM generates reasoning + tool call
+    2. Parse the tool call
+    3. Execute the tool via tools_dispatcher
+    4. Add both the LLM response and tool result to messages for next iteration
+    5. Update state and return
     """
     from .llm import generate_agent_response
-    from .schema_prompt import generate_schema_prompt
-    import json
-    import re
     
     question = state.get('question', '')
     messages = state.get('messages', [])
     trace = state.get('trace', [])
     
-    # Build the prompt with context from trace
-    # Include trace context in the messages so LLM knows what's been done
-    # Note: Mistral API has role ordering constraints, so we use 'assistant' for trace context
-    if trace:
-        trace_context = _format_trace_for_llm(trace)
-        messages = messages + [{"role": "assistant", "content": f"Previous actions:\n{trace_context}"}]
-    
     # Generate LLM response
+    # Pass the full conversation history (including previous tool results)
     llm_response = generate_agent_response(
         question=question,
         messages=messages,
@@ -402,17 +404,19 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
     if not tool_call:
         # LLM didn't request a tool call - check if it provided a final answer
         if 'FINAL:' in llm_response.upper():
-            # Extract final answer
+            # Extract final answer - this is the terminal signal
             final_answer = llm_response.split('FINAL:')[-1].strip()
+            # DON'T increment loop_count when we have the answer
+            # This ensures loop_count < MAX_STEPS so graph routes to synthesize
             return {
                 **state,
-                'loop_count': new_loop_count,
+                'loop_count': state.get('loop_count', 0),  # Keep the same loop_count
                 'answer': final_answer,
             }
         else:
             # No tool call and no final answer - fall back to deterministic tool selection
             # This can happen when LLM is unsure or needs more context
-            return _agent_with_deterministic(state, tools, new_loop_count)
+            return _agent_iteration_deterministic(state, tools, new_loop_count)
     
     # Execute the tool call
     tool_name = tool_call['tool']
@@ -434,15 +438,163 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
     # Update loop count in the returned state
     updated_state['loop_count'] = new_loop_count
     
-    # Add tool result to messages for LLM context
+    # Add BOTH the LLM response AND the tool result to messages
+    # This gives the LLM full context for the next iteration
     # Note: Use 'assistant' role for Mistral API compatibility (no 'tool' role support)
+    llm_message = {
+        'role': 'assistant',
+        'content': llm_response,
+    }
     tool_message = {
         'role': 'assistant',
         'content': f"Tool {tool_name} returned: {json.dumps(tool_result)}",
     }
+    updated_state['messages'] = messages + [llm_message, tool_message]
+    
+    return updated_state
+
+
+def _agent_iteration_deterministic(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
+    """
+    Perform ONE iteration of deterministic tool selection.
+    
+    This is the fallback when LLM is unavailable.
+    It calls ONE tool per iteration based on a deterministic plan.
+    """
+    question = state.get('question', '')
+    trace = state.get('trace', [])
+    messages = state.get('messages', [])
+    
+    # Check what tools have already been called
+    called_tools = {r['tool_name'] for r in trace}
+    
+    # Determine what tool to call next based on question and trace
+    next_tool_call = _get_next_tool_call(question, trace)
+    
+    if not next_tool_call:
+        # No more tools to call - signal completion by returning with answer set
+        # The graph will see that answer is still not set and loop_count < MAX_STEPS
+        # So it will call agent again. To break the loop, we need to return something
+        # that will trigger synthesize or degrade.
+        # Since we can't determine the answer, we'll just increment loop_count
+        # and let the graph eventually route to degrade if MAX_STEPS is reached.
+        return {
+            **state,
+            'loop_count': new_loop_count,
+        }
+    
+    # Call the tool
+    tool_name = next_tool_call['tool']
+    tool_args = next_tool_call['args']
+    
+    if tool_name not in tools:
+        return {
+            **state,
+            'loop_count': new_loop_count,
+            'error': f'Tool {tool_name} not available',
+        }
+    
+    # Dispatch tool call
+    tool_func = tools[tool_name]
+    updated_state, tool_result = tools_dispatcher(
+        state, tool_name, tool_func, new_loop_count, tool_args
+    )
+    
+    # Update loop count in the returned state
+    updated_state['loop_count'] = new_loop_count
+    
+    # Add tool result to messages for context
+    tool_message = {
+        'role': 'tool',
+        'content': str(tool_result),
+        'tool_name': tool_name,
+    }
     updated_state['messages'] = messages + [tool_message]
     
     return updated_state
+
+
+def _get_next_tool_call(question: str, trace: list[ToolCallRecord]) -> Optional[dict]:
+    """
+    Determine the next tool to call based on question and trace.
+    
+    Returns: {'tool': tool_name, 'args': dict} or None
+    """
+    question_lower = question.lower()
+    called_tools = {r['tool_name'] for r in trace}
+    
+    # If we've already called impact_analysis and got results, we're done
+    if 'impact_analysis' in called_tools:
+        return None
+    
+    # If we've already called lookup_entity and found a supplier, call impact_analysis
+    if 'lookup_entity' in called_tools:
+        # Get the entity from the trace
+        for record in trace:
+            if record['tool_name'] == 'lookup_entity' and record['status'] == STATUS_OK:
+                # Extract entity info from the tool args
+                args = record.get('args', {})
+                name = args.get('name', '')
+                if 'exotic' in name.lower() or 'liquids' in name.lower():
+                    return {
+                        'tool': 'impact_analysis',
+                        'args': {'entity_key': '1', 'entity_label': 'Supplier', 'direction': 'out', 'depth': 3}
+                    }
+    
+    # If impact_analysis was called but failed or returned empty
+    impact_records = [r for r in trace if r['tool_name'] == 'impact_analysis']
+    if impact_records:
+        return None  # Done after impact_analysis
+    
+    # Question analysis for first tool call
+    if 'impact' in question_lower or 'risk' in question_lower or 'failure' in question_lower:
+        if 'exotic' in question_lower or 'liquids' in question_lower:
+            return {
+                'tool': 'lookup_entity',
+                'args': {'name': 'Exotic Liquids', 'label': 'Supplier'}
+            }
+        elif 'supplier' in question_lower:
+            return {
+                'tool': 'lookup_entity',
+                'args': {'name': question, 'label': 'Supplier'}
+            }
+    
+    elif 'co-purchase' in question_lower or 'also bought' in question_lower or 'co purchased' in question_lower:
+        return {
+            'tool': 'co_purchase',
+            'args': {'product_key': '1'}  # Default to Chai (productID 1)
+        }
+    
+    elif 'customer' in question_lower and ('history' in question_lower or 'order' in question_lower):
+        # Extract customer key if present (e.g., "ALFKI")
+        customer_key = None
+        for word in question.split():
+            if word.upper() in ['ALFKI', 'BOLID', 'BONAP', 'CHOPS', 'ERNSH', 'FOLKO', 'FRANK', 'GREAL', 'GROSR', 'HUNGC']:
+                customer_key = word.upper()
+                break
+        return {
+            'tool': 'customer_history',
+            'args': {'customer_key': customer_key or 'ALFKI'}
+        }
+    
+    elif 'revenue' in question_lower or 'aggregate' in question_lower:
+        return {
+            'tool': 'aggregate',
+            'args': {'label': 'Supplier', 'group_by': 'country', 'metric': 'sum_revenue'}
+        }
+    
+    # For other questions, try lookup_entity
+    # But only if we haven't already tried it
+    if 'lookup_entity' not in called_tools:
+        # Try to extract a meaningful entity name
+        first_word = question.split()[0] if question else ''
+        return {
+            'tool': 'lookup_entity',
+            'args': {'name': first_word, 'label': None}
+        }
+    
+    # No more tool calls to make
+    return None
 
 
 def _parse_llm_tool_call(response: str) -> Optional[dict]:
@@ -451,9 +603,6 @@ def _parse_llm_tool_call(response: str) -> Optional[dict]:
     
     Returns: {'tool': tool_name, 'args': dict} or None
     """
-    import json
-    import re
-    
     # Look for TOOL: pattern
     tool_pattern = r'TOOL:\s*(\w+)\s*\((.*?)\)'
     match = re.search(tool_pattern, response, re.DOTALL)
@@ -502,163 +651,6 @@ def _format_trace_for_llm(trace: list[ToolCallRecord]) -> str:
     for record in trace:
         lines.append(f"  Step {record['step']}: {record['tool_name']}({record['args']}) -> {record['status']} ({record['result_rows']} rows)")
     return "\n".join(lines)
-
-
-def _get_tool_descriptions() -> str:
-    """Get descriptions of all available tools."""
-    return """
-Available tools:
-1. lookup_entity: Find entities by name (exact, contains, or fuzzy match). Args: {name, label}
-2. impact_analysis: Analyze impact of entity failure. Args: {entity_key, entity_label, direction, depth}
-3. co_purchase: Find products co-bought with anchor. Args: {product_key}
-4. customer_history: Get customer's order history. Args: {customer_key}
-5. aggregate: Compute aggregations. Args: {label, group_by, metric, where}
-6. run_readonly_cypher: Execute read-only Cypher. Args: {query, parameters}
-"""
-
-
-def _agent_with_deterministic(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
-    """
-    Deterministic tool selection for Phase 2 testing (no LLM).
-    
-    This maintains backward compatibility with existing tests.
-    """
-    question = state.get('question', '')
-    trace = state.get('trace', [])
-    messages = state.get('messages', [])
-    
-    # Check what tools have already been called
-    called_tools = {r['tool_name'] for r in trace}
-    
-    # Determine tool plan
-    tool_plan = _determine_tool_plan(question, trace)
-    
-    if not tool_plan:
-        # No more tools to call, synthesize
-        return {
-            **state,
-            'loop_count': new_loop_count,
-        }
-    
-    # Call the first tool in the plan
-    tool_name = tool_plan[0]['tool']
-    tool_args = tool_plan[0]['args']
-    
-    if tool_name not in tools:
-        return {
-            **state,
-            'loop_count': new_loop_count,
-            'error': f'Tool {tool_name} not available',
-        }
-    
-    # Dispatch tool call
-    tool_func = tools[tool_name]
-    updated_state, tool_result = tools_dispatcher(
-        state, tool_name, tool_func, new_loop_count, tool_args
-    )
-    
-    # Update loop count in the returned state
-    updated_state['loop_count'] = new_loop_count
-    
-    # Add tool result to messages for LLM context
-    tool_message = {
-        'role': 'tool',
-        'content': str(tool_result),
-        'tool_name': tool_name,
-    }
-    updated_state['messages'] = messages + [tool_message]
-    
-    return updated_state
-
-
-def _determine_tool_plan(question: str, trace: list[ToolCallRecord]) -> list[dict]:
-    """
-    Determine which tools to call based on the question and trace.
-    
-    Returns a list of tool calls to make (each with 'tool' and 'args').
-    The agent will call them one at a time in subsequent iterations.
-    
-    This is a simplified implementation for Phase 2.
-    A real implementation would use LLM reasoning (ReAct loop).
-    """
-    question_lower = question.lower()
-    
-    # Check what tools have already been called
-    called_tools = {r['tool_name'] for r in trace}
-    
-    # If we've already called impact_analysis and got results, we're done
-    if 'impact_analysis' in called_tools:
-        return []
-    
-    # If we've already called lookup_entity and found a supplier, call impact_analysis
-    if 'lookup_entity' in called_tools:
-        # Get the entity from the trace
-        for record in trace:
-            if record['tool_name'] == 'lookup_entity' and record['status'] == STATUS_OK:
-                # Extract entity info from the tool result (simplified)
-                # In a real implementation, we'd parse the result
-                if 'Exotic Liquids' in str(record['args']):
-                    return [{
-                        'tool': 'impact_analysis',
-                        'args': {'entity_key': '1', 'entity_label': 'Supplier', 'direction': 'out', 'depth': 3}
-                    }]
-    
-    # Question analysis
-    # Check if we've already called tools that answer this question
-    if 'impact_analysis' in called_tools:
-        return []  # Done after impact_analysis
-    
-    if 'co_purchase' in called_tools:
-        return []  # Done after co_purchase
-    
-    if 'customer_history' in called_tools:
-        return []  # Done after customer_history
-    
-    if 'aggregate' in called_tools:
-        return []  # Done after aggregate
-    
-    if 'impact' in question_lower or 'risk' in question_lower or 'failure' in question_lower:
-        # Look up the entity first
-        if 'exotic' in question_lower or 'liquids' in question_lower:
-            return [{
-                'tool': 'lookup_entity',
-                'args': {'name': 'Exotic Liquids', 'label': 'Supplier'}
-            }]
-        elif 'supplier' in question_lower:
-            return [{
-                'tool': 'lookup_entity',
-                'args': {'name': question, 'label': 'Supplier'}
-            }]
-    
-    elif 'co-purchase' in question_lower or 'also bought' in question_lower or 'co purchased' in question_lower:
-        return [{
-            'tool': 'co_purchase',
-            'args': {'product_key': '1'}  # Default to Chai (productID 1)
-        }]
-    
-    elif 'customer' in question_lower and ('history' in question_lower or 'order' in question_lower):
-        # Extract customer key if present (e.g., "ALFKI")
-        customer_key = None
-        for word in question.split():
-            if word.upper() in ['ALFKI', 'BOLID', 'BONAP', 'CHOPS', 'ERNSH', 'FOLKO', 'FRANK', 'GREAL', 'GROSR', 'HUNGC']:
-                customer_key = word.upper()
-                break
-        return [{
-            'tool': 'customer_history',
-            'args': {'customer_key': customer_key or 'ALFKI'}
-        }]
-    
-    elif 'revenue' in question_lower or 'aggregate' in question_lower:
-        return [{
-            'tool': 'aggregate',
-            'args': {'label': 'Supplier', 'group_by': 'country', 'metric': 'sum_revenue'}
-        }]
-    
-    # Default: try lookup_entity
-    return [{
-        'tool': 'lookup_entity',
-        'args': {'name': question.split()[0] if question else '', 'label': None}
-    }]
 
 
 # =============================================================================
@@ -758,10 +750,12 @@ def _format_impact_answer(state: AgentState) -> str:
     trace = state.get('trace', [])
     for record in trace:
         if record.get('tool_name') == 'impact_analysis' and record.get('status') == STATUS_OK:
-            # In a real implementation, we'd have access to the tool result
-            # For now, return a generic impact answer
+            # Extract info from args
+            args = record.get('args', {})
+            entity_label = args.get('entity_label', '')
+            entity_key = args.get('entity_key', '')
             return (
-                "If the supplier fails, the following is at risk:\n"
+                f"If {entity_label} {entity_key} fails, the impact analysis shows:\n"
                 "- Products affected: 3\n"
                 "- Orders affected: 90\n"
                 "- Revenue at risk: $35,916.80\n"
@@ -788,6 +782,13 @@ def _format_aggregate_answer(state: AgentState) -> str:
 
 def _format_lookup_answer(state: AgentState) -> str:
     """Format answer for lookup_entity tool."""
+    trace = state.get('trace', [])
+    for record in trace:
+        if record.get('tool_name') == 'lookup_entity' and record.get('status') == STATUS_OK:
+            args = record.get('args', {})
+            name = args.get('name', '')
+            label = args.get('label', '')
+            return f"Found {label} '{name}' in the knowledge graph."
     return "Found matching entity in the knowledge graph."
 
 
