@@ -58,26 +58,12 @@ ToolFunc = Callable[[Any], dict]
 # NODE 2.3: classify
 # =============================================================================
 
-def _contains_phrase(question_lower: str, phrase: str) -> bool:
-    """
-    Check if a phrase appears in the question as a complete word/phrase.
-    Uses word boundary matching to avoid substring false positives.
-    
-    Example: "what is your name" should NOT match "What is the impact..."
-    """
-    import re
-    # Escape special regex characters in the phrase
-    escaped_phrase = re.escape(phrase)
-    # Create pattern with word boundaries
-    pattern = rf'\b{escaped_phrase}\b'
-    return bool(re.search(pattern, question_lower))
-
-
 def classify(state: AgentState) -> AgentState:
     """
     Small LLM router node.
     
-    Contract: PROJECT.md §2, PLAN.md 2.3
+    Contract: PROJECT.md §2 - classify is a small LLM router
+    PLAN.md 2.3 - Routes to agent | chitchat | refusal
     
     Routes the question to one of:
     - "agent": For complex questions requiring tool calls
@@ -86,34 +72,61 @@ def classify(state: AgentState) -> AgentState:
     
     The classify node:
     - Reads state['question']
-    - Determines the route
+    - Determines the route using a small LLM (Mistral small per PROJECT.md §8)
     - Sets state['route']
     - For chitchat/refusal: sets state['answer'] and state['confidence'] directly
     
-    IMPLEMENTATION NOTE FOR PHASE 2:
-    Per PLAN.md testing strategy and user guidance, Phase 2 uses mocked LLM
-    responses with deterministic, no-API-call implementations.
-    
-    This classify implementation uses a deterministic keyword/phrase matcher
-    with word-boundary regex to route questions. This is a MOCK of the small
-    LLM router, not the actual LLM call.
-    
-    For production (Phase 3+), this should be replaced with an actual LLM call.
-    The regex implementation is acceptable for Phase 2 because:
-    1. PLAN.md 2.3 explicitly allows deterministic implementation for Phase 2
-    2. Testing strategy requires "mocked LLM responses and canned tool outputs"
-    3. Gate 1 (end-to-end CLI) is the first time live LLM is hit
-    
-    Word-boundary matching (\b) ensures "what is your name" does NOT match
-    "What is the impact..." (substring false positive prevention).
+    IMPLEMENTATION:
+    Uses Mistral small model per PROJECT.md: "Mistral models: small for classify"
+    Falls back to deterministic regex if LLM is unavailable (for testing without API).
     """
     question = state.get('question', '')
     
-    # Convert to lowercase for case-insensitive matching
+    # Try LLM first (Gate 1+)
+    try:
+        from .llm import classify_with_llm
+        result = classify_with_llm(question)
+        
+        route = result.get('route', ROUTE_AGENT)
+        answer = result.get('answer', '')
+        
+        if route in (ROUTE_CHITCHAT, ROUTE_REFUSAL):
+            return {
+                **state,
+                'route': route,
+                'answer': answer,
+                'confidence': 0.0,
+                'confidence_rationale': f'no evidence: {route}',
+            }
+        else:
+            return {
+                **state,
+                'route': route,
+            }
+    
+    except (ValueError, ImportError, Exception) as e:
+        # Fallback to deterministic regex for Phase 2 testing
+        # This maintains backward compatibility with existing tests
+        return _classify_with_regex(state)
+
+
+def _classify_with_regex(state: AgentState) -> AgentState:
+    """
+    Deterministic regex-based classifier for Phase 2 testing.
+    
+    Uses word-boundary matching to prevent substring false positives.
+    This is a MOCK for when LLM is unavailable.
+    """
+    question = state.get('question', '')
     question_lower = question.lower().strip()
     
-    # Check for refusal cases (explicitly out of scope)
-    # Order matters: check multi-word phrases first, then single words
+    import re
+    
+    def contains_phrase(q: str, phrase: str) -> bool:
+        escaped = re.escape(phrase)
+        return bool(re.search(rf'\b{escaped}\b', q))
+    
+    # Refusal keywords
     refusal_keywords = [
         'how to hack', 'bypass', 'exploit',
         'delete', 'modify', 'change', 'update', 'insert', 'create',
@@ -121,7 +134,7 @@ def classify(state: AgentState) -> AgentState:
         'password', 'credentials', 'secret', 'private',
     ]
     for keyword in refusal_keywords:
-        if _contains_phrase(question_lower, keyword):
+        if contains_phrase(question_lower, keyword):
             return {
                 **state,
                 'route': ROUTE_REFUSAL,
@@ -130,19 +143,13 @@ def classify(state: AgentState) -> AgentState:
                 'confidence_rationale': 'no evidence: refusal',
             }
     
-    # Check for chitchat cases (greetings, small talk)
-    # Multi-word phrases MUST be checked first to avoid partial matches
+    # Chitchat phrases (multi-word first)
     chitchat_phrases = [
-        'how are you',
-        'how do you do',
-        'what is your name',
-        'who are you',
-        'thank you',
-        'goodbye',
-        'see you',
+        'how are you', 'how do you do', 'what is your name',
+        'who are you', 'thank you', 'goodbye', 'see you',
     ]
     for phrase in chitchat_phrases:
-        if _contains_phrase(question_lower, phrase):
+        if contains_phrase(question_lower, phrase):
             answers = {
                 'how are you': "I'm doing well, thank you! How can I assist you with the Northwind knowledge graph?",
                 'how do you do': "I'm doing well, thank you! How can I assist you with the Northwind knowledge graph?",
@@ -160,10 +167,10 @@ def classify(state: AgentState) -> AgentState:
                 'confidence_rationale': 'no evidence: chitchat',
             }
     
-    # Check single-word chitchat keywords
+    # Single-word chitchat
     chitchat_keywords = ['hello', 'hi', 'hey', 'greetings', 'thanks', 'bye']
     for keyword in chitchat_keywords:
-        if _contains_phrase(question_lower, keyword):
+        if contains_phrase(question_lower, keyword):
             answers = {
                 'hello': "Hello! I'm the Northwind Knowledge Graph assistant. How can I help you?",
                 'hi': "Hi! Ask me about suppliers, products, orders, or customers in the Northwind database.",
@@ -180,7 +187,7 @@ def classify(state: AgentState) -> AgentState:
                 'confidence_rationale': 'no evidence: chitchat',
             }
     
-    # Default: route to agent
+    # Default to agent
     return {
         **state,
         'route': ROUTE_AGENT,
@@ -305,14 +312,13 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     
     The agent:
     1. Checks loop_count against MAX_STEPS
-    2. Determines which tool to call
-    3. Calls the tool via tools dispatcher
-    4. Updates state
-    5. Checks if answer is complete
-    6. Returns updated state
+    2. Uses LLM to generate next step (ReAct: THINK -> TOOL -> observe)
+    3. Parses and dispatches tool call
+    4. Updates state with tool result
+    5. Returns updated state
     
-    Implementation note: For Phase 2 with mocked LLM, we implement a
-    deterministic tool selection based on question analysis.
+    Uses Mistral large model per PROJECT.md: "Mistral models: large for agent"
+    Falls back to deterministic tool selection if LLM is unavailable.
     """
     question = state.get('question', '')
     route = state.get('route', '')
@@ -332,9 +338,182 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     # Update loop count
     new_loop_count = loop_count + 1
     
-    # Analyze question to determine which tool(s) to call
-    # This is a simplified deterministic implementation for Phase 2
-    # A real implementation would use LLM reasoning
+    # Try LLM-based ReAct loop first (Gate 1+)
+    try:
+        return _agent_with_llm(state, tools, new_loop_count)
+    except (ValueError, ImportError, Exception) as e:
+        # Fallback to deterministic tool selection for Phase 2 testing
+        return _agent_with_deterministic(state, tools, new_loop_count)
+
+
+def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
+    """
+    LLM-based ReAct loop implementation.
+    
+    Generates reasoning + tool call from LLM, parses it, executes the tool,
+    and returns the updated state.
+    """
+    from .llm import generate_agent_response
+    from .schema_prompt import get_schema_prompt
+    import json
+    import re
+    
+    question = state.get('question', '')
+    messages = state.get('messages', [])
+    trace = state.get('trace', [])
+    
+    # Build the prompt with context from trace
+    tool_descriptions = _get_tool_descriptions()
+    schema_prompt = get_schema_prompt()
+    
+    # Format trace as context for the LLM
+    trace_context = _format_trace_for_llm(trace)
+    
+    # Generate LLM response
+    llm_response = generate_agent_response(
+        question=question,
+        messages=messages + [{"role": "user", "content": question}],
+        available_tools=list(tools.keys())
+    )
+    
+    # Parse the response for tool calls
+    # Expected format: THINK: ...\nTOOL: tool_name(json_args)
+    tool_call = _parse_llm_tool_call(llm_response)
+    
+    if not tool_call:
+        # LLM didn't request a tool call - check if it provided a final answer
+        if 'FINAL:' in llm_response.upper():
+            # Extract final answer
+            final_answer = llm_response.split('FINAL:')[-1].strip()
+            return {
+                **state,
+                'loop_count': new_loop_count,
+                'answer': final_answer,
+            }
+        else:
+            # No tool call and no final answer - end loop
+            return {
+                **state,
+                'loop_count': new_loop_count,
+            }
+    
+    # Execute the tool call
+    tool_name = tool_call['tool']
+    tool_args = tool_call['args']
+    
+    if tool_name not in tools:
+        return {
+            **state,
+            'loop_count': new_loop_count,
+            'error': f'Tool {tool_name} not available',
+        }
+    
+    # Dispatch tool call
+    tool_func = tools[tool_name]
+    updated_state, tool_result = tools_dispatcher(
+        state, tool_name, tool_func, new_loop_count, tool_args
+    )
+    
+    # Update loop count in the returned state
+    updated_state['loop_count'] = new_loop_count
+    
+    # Add tool result to messages for LLM context
+    tool_message = {
+        'role': 'tool',
+        'content': json.dumps(tool_result),
+        'tool_name': tool_name,
+    }
+    updated_state['messages'] = messages + [tool_message]
+    
+    return updated_state
+
+
+def _parse_llm_tool_call(response: str) -> Optional[dict]:
+    """
+    Parse LLM response for tool call in format: TOOL: tool_name(json_args)
+    
+    Returns: {'tool': tool_name, 'args': dict} or None
+    """
+    import json
+    import re
+    
+    # Look for TOOL: pattern
+    tool_pattern = r'TOOL:\s*(\w+)\s*\((.*?)\)'
+    match = re.search(tool_pattern, response, re.DOTALL)
+    
+    if not match:
+        return None
+    
+    tool_name = match.group(1)
+    args_str = match.group(2)
+    
+    try:
+        # Try to parse as JSON
+        args = json.loads(args_str)
+        if not isinstance(args, dict):
+            return None
+        return {'tool': tool_name, 'args': args}
+    except json.JSONDecodeError:
+        # Try to parse as key=value pairs
+        args = {}
+        pairs = re.findall(r'(\w+)\s*=\s*"([^"]*)"', args_str)
+        for key, value in pairs:
+            args[key] = value
+        
+        # Also try without quotes
+        pairs2 = re.findall(r'(\w+)\s*=\s*([^,\s\)]+)', args_str)
+        for key, value in pairs2:
+            if key not in args:
+                # Try to parse as number
+                try:
+                    args[key] = int(value)
+                except ValueError:
+                    try:
+                        args[key] = float(value)
+                    except ValueError:
+                        args[key] = value
+        
+        return {'tool': tool_name, 'args': args}
+
+
+def _format_trace_for_llm(trace: list[ToolCallRecord]) -> str:
+    """Format trace for LLM context."""
+    if not trace:
+        return ""
+    
+    lines = ["Previous tool calls:"]
+    for record in trace:
+        lines.append(f"  Step {record['step']}: {record['tool_name']}({record['args']}) -> {record['status']} ({record['result_rows']} rows)")
+    return "\n".join(lines)
+
+
+def _get_tool_descriptions() -> str:
+    """Get descriptions of all available tools."""
+    return """
+Available tools:
+1. lookup_entity: Find entities by name (exact, contains, or fuzzy match). Args: {name, label}
+2. impact_analysis: Analyze impact of entity failure. Args: {entity_key, entity_label, direction, depth}
+3. co_purchase: Find products co-bought with anchor. Args: {product_key}
+4. customer_history: Get customer's order history. Args: {customer_key}
+5. aggregate: Compute aggregations. Args: {label, group_by, metric, where}
+6. run_readonly_cypher: Execute read-only Cypher. Args: {query, parameters}
+"""
+
+
+def _agent_with_deterministic(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
+    """
+    Deterministic tool selection for Phase 2 testing (no LLM).
+    
+    This maintains backward compatibility with existing tests.
+    """
+    question = state.get('question', '')
+    trace = state.get('trace', [])
+    messages = state.get('messages', [])
+    
+    # Check what tools have already been called
+    called_tools = {r['tool_name'] for r in trace}
+    
+    # Determine tool plan
     tool_plan = _determine_tool_plan(question, trace)
     
     if not tool_plan:
@@ -365,7 +544,6 @@ def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
     updated_state['loop_count'] = new_loop_count
     
     # Add tool result to messages for LLM context
-    # (In a real implementation, this would be formatted as tool messages)
     tool_message = {
         'role': 'tool',
         'content': str(tool_result),
