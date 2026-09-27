@@ -153,7 +153,6 @@ def run_graph_on_question(question: str, graph) -> AgentState:
         'route': '',
         'messages': [],
         'trace': [],
-        'tool_results': {},
         'answer': '',
         'citations': [],
         'confidence': 0.0,
@@ -231,12 +230,21 @@ def print_result(question_id: str, question: str, state: AgentState, passed: boo
         for err in errors:
             print(f"    - {err}")
     
-    # Print trace summary
+    # Print trace with full ToolCallRecord details
     trace = state.get('trace', [])
     if trace:
         print(f"  Trace: {len(trace)} tool calls")
         for record in trace:
-            print(f"    Step {record['step']}: {record['tool_name']} ({record['status']})")
+            # Print all fields of ToolCallRecord per PROJECT.md §3
+            print(f"    Step {record['step']}:")
+            print(f"      tool_name: {record['tool_name']}")
+            print(f"      args: {record['args']}")
+            print(f"      mode: {record['mode']}")
+            print(f"      status: {record['status']}")
+            print(f"      result_rows: {record['result_rows']}")
+            print(f"      cypher: {record['cypher']}")
+            print(f"      latency_ms: {record['latency_ms']}")
+            print(f"      retry_count: {record['retry_count']}")
     
     # Print any error
     if state.get('error'):

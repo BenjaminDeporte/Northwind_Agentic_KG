@@ -78,7 +78,6 @@ class AgentState(TypedDict):
     route: str                      # "agent" | "chitchat" | "refusal" | "degrade"
     messages: Annotated[list, "add_messages"]  # ONLY field with a reducer
     trace: list[ToolCallRecord]
-    tool_results: dict[int, dict]   # Maps step number to tool result dict
     answer: str
     citations: list[Citation]
     confidence: float
