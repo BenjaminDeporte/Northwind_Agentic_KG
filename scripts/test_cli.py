@@ -26,13 +26,15 @@ import json
 from typing import Optional
 from pathlib import Path
 
-# Add src to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+# Install the src package in editable mode for this script
+src_path = str(Path(__file__).parent.parent)
+sys.path.insert(0, src_path)
 
-from agents.state import AgentState, ROUTE_AGENT, ROUTE_CHITCHAT, ROUTE_REFUSAL, ROUTE_DEGRADE
-from agents.nodes import classify, agent, synthesize, degrade, tools_dispatcher
-from agents.graph import build_graph, compile_graph
-from neo4j.tools import (
+# Now import everything properly
+from src.agents.state import AgentState, ROUTE_AGENT, ROUTE_CHITCHAT, ROUTE_REFUSAL, ROUTE_DEGRADE
+from src.agents.nodes import classify, agent, synthesize, degrade, tools_dispatcher
+from src.agents.graph import build_graph, compile_graph
+from src.neo4j.tools import (
     lookup_entity,
     impact_analysis,
     co_purchase,
@@ -156,7 +158,9 @@ def run_full_pipeline(question: str) -> AgentState:
     elif route == ROUTE_AGENT:
         # Run agent loop
         max_iterations = 10  # Safety limit
+        prev_trace_length = 0
         for _ in range(max_iterations):
+            prev_trace_length = len(state.get('trace', []))
             old_route = state.get('route', '')
             state = agent(state, tools)
             
@@ -176,9 +180,10 @@ def run_full_pipeline(question: str) -> AgentState:
                 state = degrade(state)
                 break
             
-            # Prevent infinite loop
-            if new_route == old_route and not state.get('answer'):
-                # Agent didn't make progress
+            # Prevent infinite loop - check if progress was made
+            # Progress = trace grew or answer was set
+            if new_route == old_route and not state.get('answer') and len(state.get('trace', [])) <= prev_trace_length:
+                # Agent didn't make progress (no new tool calls)
                 break
         
         # Step 3: Synthesize if we have a route of agent
@@ -227,8 +232,8 @@ def verify_state(state: AgentState, expected_route: str, min_confidence: float) 
         if not trace:
             errors.append("Empty trace for agent route")
     
-    # Check for errors
-    if state.get('error'):
+    # Check for errors (but allow errors for degrade route - they indicate expected degradation)
+    if state.get('error') and state.get('route') != ROUTE_DEGRADE:
         errors.append(f"Error in state: {state['error']}")
     
     passed = len(errors) == 0

@@ -10,7 +10,7 @@ Authoritative contracts:
 
 import os
 from typing import Any
-from mistralai.client import Mistral
+from mistralai import Mistral
 
 
 # =============================================================================
@@ -129,8 +129,13 @@ RULES:
 4. If you cannot find the answer after {max_steps} steps, stop and provide what you have.
 5. Be accurate and cite specific data from the tools.
 
-AVAILABLE TOOLS:
-{tool_descriptions}
+AVAILABLE TOOLS with their exact parameter names:
+- lookup_entity(name: str, label: str | None = None) -> Find entities by name
+- impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> Analyze impact
+- co_purchase(product_key: str) -> Find co-purchased products
+- customer_history(customer_key: str) -> Get customer order history
+- aggregate(label: str, group_by: str, metric: str, where: str | None = None) -> Compute aggregations
+- run_readonly_cypher(query: str) -> Execute read-only Cypher
 
 SCHEMA:
 {schema_prompt}
@@ -138,12 +143,21 @@ SCHEMA:
 RESPONSE FORMAT:
 For each step, output your reasoning, then make a tool call using the format:
 THINK: <your reasoning>
-TOOL: <tool_name>(<json_arguments>)
+TOOL: <tool_name>({{json_arguments}})
 
 When you have enough information to answer, output:
 FINAL: <your final answer>
 
-IMPORTANT: Only use the tools listed above. Do NOT make up information.
+IMPORTANT: 
+- Use EXACT parameter names as listed above
+- For lookup_entity: use {{name: "entity name", label: "NodeLabel"}} 
+- For impact_analysis: use {{entity_key: "id", entity_label: "NodeLabel", direction: "out", depth: 3}}
+- For customer_history: use {{customer_key: "customerID"}}
+- For co_purchase: use {{product_key: "productID"}}
+- For aggregate: use {{label: "NodeLabel", group_by: "property", metric: "sum_revenue"}}
+- For run_readonly_cypher: use {{query: "CYPHER QUERY"}}
+- json_arguments must be valid JSON
+- Only use the tools listed above. Do NOT make up information.
 """
 
 
@@ -173,19 +187,41 @@ def generate_agent_response(question: str, messages: list[dict], available_tools
     """
     Generate an agent response using the large LLM.
     
+    Uses ReAct format: THINK: ...\nTOOL: tool_name(json_args)\nFINAL: answer
+    
     Args:
         question: The current question
         messages: Previous messages in the conversation
         available_tools: List of available tool names
     
     Returns:
-        The LLM's response text
+        The LLM's response text in ReAct format
     """
     client = get_mistral_client()
     
+    # Build tool descriptions
+    tool_descriptions = "\n".join([
+        f"{i+1}. {tool}: Available tool" 
+        for i, tool in enumerate(available_tools)
+    ])
+    
+    # Generate schema prompt
+    try:
+        from .schema_prompt import generate_schema_prompt
+        schema_prompt = generate_schema_prompt()
+    except Exception:
+        schema_prompt = "Northwind knowledge graph with Supplier, Product, Order, Customer nodes and SUPPLIES, ORDERS, PURCHASED relationships."
+    
+    # Build the system prompt with ReAct format instructions
+    system_prompt = AGENT_SYSTEM_PROMPT_TEMPLATE.format(
+        max_steps=8,
+        tool_descriptions=tool_descriptions,
+        schema_prompt=schema_prompt
+    )
+    
     # Convert messages to Mistral format
     mistral_messages = [
-        {"role": "system", "content": AGENT_SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
     ]
     for msg in messages:
         role = msg.get('role', 'user')

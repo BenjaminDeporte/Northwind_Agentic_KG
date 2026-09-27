@@ -373,7 +373,7 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
     and returns the updated state.
     """
     from .llm import generate_agent_response
-    from .schema_prompt import get_schema_prompt
+    from .schema_prompt import generate_schema_prompt
     import json
     import re
     
@@ -382,16 +382,16 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
     trace = state.get('trace', [])
     
     # Build the prompt with context from trace
-    tool_descriptions = _get_tool_descriptions()
-    schema_prompt = get_schema_prompt()
-    
-    # Format trace as context for the LLM
-    trace_context = _format_trace_for_llm(trace)
+    # Include trace context in the messages so LLM knows what's been done
+    # Note: Mistral API has role ordering constraints, so we use 'assistant' for trace context
+    if trace:
+        trace_context = _format_trace_for_llm(trace)
+        messages = messages + [{"role": "assistant", "content": f"Previous actions:\n{trace_context}"}]
     
     # Generate LLM response
     llm_response = generate_agent_response(
         question=question,
-        messages=messages + [{"role": "user", "content": question}],
+        messages=messages,
         available_tools=list(tools.keys())
     )
     
@@ -410,11 +410,9 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
                 'answer': final_answer,
             }
         else:
-            # No tool call and no final answer - end loop
-            return {
-                **state,
-                'loop_count': new_loop_count,
-            }
+            # No tool call and no final answer - fall back to deterministic tool selection
+            # This can happen when LLM is unsure or needs more context
+            return _agent_with_deterministic(state, tools, new_loop_count)
     
     # Execute the tool call
     tool_name = tool_call['tool']
@@ -437,10 +435,10 @@ def _agent_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_coun
     updated_state['loop_count'] = new_loop_count
     
     # Add tool result to messages for LLM context
+    # Note: Use 'assistant' role for Mistral API compatibility (no 'tool' role support)
     tool_message = {
-        'role': 'tool',
-        'content': json.dumps(tool_result),
-        'tool_name': tool_name,
+        'role': 'assistant',
+        'content': f"Tool {tool_name} returned: {json.dumps(tool_result)}",
     }
     updated_state['messages'] = messages + [tool_message]
     
@@ -606,6 +604,19 @@ def _determine_tool_plan(question: str, trace: list[ToolCallRecord]) -> list[dic
                     }]
     
     # Question analysis
+    # Check if we've already called tools that answer this question
+    if 'impact_analysis' in called_tools:
+        return []  # Done after impact_analysis
+    
+    if 'co_purchase' in called_tools:
+        return []  # Done after co_purchase
+    
+    if 'customer_history' in called_tools:
+        return []  # Done after customer_history
+    
+    if 'aggregate' in called_tools:
+        return []  # Done after aggregate
+    
     if 'impact' in question_lower or 'risk' in question_lower or 'failure' in question_lower:
         # Look up the entity first
         if 'exotic' in question_lower or 'liquids' in question_lower:
@@ -619,19 +630,25 @@ def _determine_tool_plan(question: str, trace: list[ToolCallRecord]) -> list[dic
                 'args': {'name': question, 'label': 'Supplier'}
             }]
     
-    elif 'co-purchase' in question_lower or 'also bought' in question_lower:
+    elif 'co-purchase' in question_lower or 'also bought' in question_lower or 'co purchased' in question_lower:
         return [{
             'tool': 'co_purchase',
             'args': {'product_key': '1'}  # Default to Chai (productID 1)
         }]
     
-    elif 'customer history' in question_lower or 'orders' in question_lower:
+    elif 'customer' in question_lower and ('history' in question_lower or 'order' in question_lower):
+        # Extract customer key if present (e.g., "ALFKI")
+        customer_key = None
+        for word in question.split():
+            if word.upper() in ['ALFKI', 'BOLID', 'BONAP', 'CHOPS', 'ERNSH', 'FOLKO', 'FRANK', 'GREAL', 'GROSR', 'HUNGC']:
+                customer_key = word.upper()
+                break
         return [{
             'tool': 'customer_history',
-            'args': {'customer_key': 'ALFKI'}
+            'args': {'customer_key': customer_key or 'ALFKI'}
         }]
     
-    elif 'revenue by' in question_lower or 'aggregate' in question_lower:
+    elif 'revenue' in question_lower or 'aggregate' in question_lower:
         return [{
             'tool': 'aggregate',
             'args': {'label': 'Supplier', 'group_by': 'country', 'metric': 'sum_revenue'}
