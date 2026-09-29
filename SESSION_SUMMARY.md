@@ -1,111 +1,29 @@
-# Session Summary - Northwind Agentic KG
+# Session Summary — Northwind Agentic KG
 
-**Session Date:** 2026-09-27  
-**Next Session:** Continue from this point
+**Updated:** 2026-09-29 15:12:21 CEST (Europe/Paris)
+**Current milestone:** Gate 1 verified; Phase 3 Streamlit GUI next.
 
----
+## Work completed
 
-## ✅ Completed Tasks
+- Reviewed the implementation against `README.md`, `SCHEMA.md`, `PROJECT.md`, and `PLAN.md`, then corrected the Gate 1 contract deviations. The compiled LangGraph now has a separate tool node, `messages` uses `add_messages`, and every executed tool call produces one trace record. The eight-step budget routes to `degrade` with a truncation disclosure.
+- Reworked the Neo4j client and tools for read-only execution, query validation and schema-aware retry. `impact_analysis` returns the actual evidence subgraph and executive aggregates. Entity lookup covers all nine graph labels; aggregation uses fixed, parameterized join patterns, caps results at 20 groups, and includes contributing node handles. Customer history, co-purchase, and exploratory Cypher were also corrected.
+- Built final answers from actual tool outputs. The agent creates canonical `Citation` objects for claims it makes, validates the Mistral synthesis draft against the local evidence, and falls back to a grounded answer when needed. Tool-call parsing handles formatted responses and nested JSON.
+- Amended `PROJECT.md` §4.6 **with the user's explicit approval** so aggregate groups include `evidence: [{label, key, name}]`. This supplies node citations for aggregate claims. No other contract change was authorized.
+- Rewrote the Gate 1 CLI checks to exercise the compiled graph with live questions and deterministic budget and retry probes. Added focused regression coverage for graph flow, tools, citations, synthesis, and run logging. The production run log remains append-only.
 
-### 1. Contract Compliance Audit (PROJECT.md vs Code)
-- **Status:** COMPLETE - NO VIOLATIONS FOUND
-- Verified all TypedDict definitions in `src/agents/state.py` match PROJECT.md §3 exactly:
-  - `ToolCallRecord`: 9 fields (step, tool_name, args, mode, status, result_rows, cypher, latency_ms, retry_count)
-  - `Citation`: 3 fields (label, key, name)
-  - `AgentState`: 10 fields (question, route, messages, trace, answer, citations, confidence, confidence_rationale, loop_count, error)
-- Verified all 6 tool signatures match PROJECT.md §4 exactly:
-  - `lookup_entity(name: str, label: str | None = None) -> dict`
-  - `impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> dict`
-  - `co_purchase(product_key: str) -> dict`
-  - `customer_history(customer_key: str) -> dict`
-  - `run_readonly_cypher(query: str) -> dict`
-  - `aggregate(label: str, group_by: str, metric: str, where: str | None = None) -> dict`
-- **Note:** Non-contractual `result` field was previously in ToolCallRecord and has been correctly removed. Tool results are now stored in `messages` list (the contract-compliant reducer field).
+## Verification
 
-### 2. Git Branch Divergence Resolution
-- **Status:** COMPLETE
-- **Problem:** Local `master` had 3 commits, remote `origin/master` had 1 different commit
-- **Solution:** 
-  1. `git pull --rebase origin master` (encountered conflict in `scripts/test_cli.py`)
-  2. Resolved conflict by keeping cleaner version (removed redundant `build_graph` call)
-  3. `git rebase --continue` completed successfully
-  4. `git push --force-with-lease origin master` updated remote
-- **Result:** Clean linear history, branch up to date with origin/master
+- `uv run --no-sync python -m pytest -q -o addopts=''`: **208 passed** on the final implementation.
+- `uv run --no-sync python -u scripts/test_cli.py`: **9/9 Gate 1 cases passed** (seven live question cases and two controlled probes). The cases cover supplier impact, exploratory Cypher, co-purchase, customer history, aggregation, chitchat, refusal, budget exhaustion, and retry.
+- Live AuraDB checks also exercised aggregation across all nine supported labels and incoming impact traversal.
 
----
+## Decisions and constraints
 
-## 📊 Current State
+- Manage the Python environment with **uv** and run commands through `uv run`.
+- `PROJECT.md` and `SCHEMA.md` are authoritative. Preserve the six tool signatures, read-only graph access, `MAX_STEPS=8`, one trace entry per executed tool call, and citations backed by graph nodes.
+- The user authorized sending **read-only Northwind tool results to Mistral** for answer generation. This is implemented and noted in `src/agents/llm.py`; **revisit this data-sharing choice later** as requested.
 
-### Git Status
-```
-On branch master
-Your branch is up to date with 'origin/master'.
-nothing to commit, working tree clean
-```
+## Handoff
 
-### Latest Commits
-```
-bce9b86 Test cli passed
-294d2a0 Gate 1: Fix answer synthesis to use actual tool results  
-f338cb6 Gate 1: Use actual compiled LangGraph with live LLM integration
-13e431d Gate 1: Use actual compiled LangGraph with live LLM integration
-0aee7d8 Fix Mistral import and LLM integration for Gate 1
-```
-
-### Key Files Modified (This Session)
-- `scripts/test_cli.py` - Resolved rebase conflict (removed redundant `graph = build_graph(tools)` line)
-
----
-
-## 🎯 Outstanding Items (From Compaction Summary)
-
-### High Priority
-1. **Fix `_parse_llm_tool_call` in `src/agents/nodes.py`**
-   - Currently broken for markdown-formatted tool calls like `**TOOL**: run_readonly_cypher({...})`
-   - Need robust parsing for: `**TOOL**:`, backticks, and nested JSON in Cypher queries
-   - This breaks `q2_exploratory` test
-
-### Already Working
-- `q7_degrade` now shows 8 tool calls (fixed via `_get_next_tool_call` cycling)
-- All 243 unit tests still pass
-
----
-
-## 📝 Next Session Priority
-
-**Start with:** Fix `_parse_llm_tool_call` function in `src/agents/nodes.py`
-
-The current implementation needs to handle:
-- Markdown bold formatting: `**TOOL**: tool_name({...})`
-- Backtick formatting: `` `tool_name({...})` ``
-- Nested braces in JSON args (especially for Cypher queries)
-
-Then verify all 7 Gate 1 tests pass:
-- q1_wow_impact
-- q2_exploratory (currently broken)
-- q3_co_purchase
-- q4_churn
-- q5_chitchat
-- q6_refusal
-- q7_degrade (fixed)
-
----
-
-## 🔒 Constraints to Remember
-
-- **DO NOT TOUCH:** PLAN.md, PROJECT.md, GROUND_TRUTH*.md files
-- **DO NOT TOUCH:** SCHEMA.md
-- ToolCallRecord must remain compliant with PROJECT.md §3
-- All tool signatures must match PROJECT.md §4 exactly
-- MAX_STEPS=8 invariant must be maintained
-- Every tool call must append exactly one ToolCallRecord
-- Budget exhaustion must route to degrade, never to synthesize
-
----
-
-## 📋 Implementation Notes
-
-- Tool results are stored in `messages` list (contract-compliant reducer field)
-- Agent sets `state['answer']` directly when ready
-- Full ToolCallRecord details printed in test output
-- Non-contractual fields have been removed from ToolCallRecord
+- The Gate 1 code and contract amendment are included in the current source changes. `runlog.jsonl` contains appended entries from the CLI runs. Do not rely on the 2026-09-27 handoff's clean-tree status, test count, or claim that exploratory question 2 is broken; those are superseded by this update.
+- Next planned work: Phase 3 Streamlit GUI with chat, trace drawer, and evidence graph panels. Phase 4 scripted-question demo and analyzer remain after that.

@@ -155,13 +155,16 @@ FINAL: <your final answer>
 
 IMPORTANT: 
 - Use EXACT parameter names as listed above
-- For lookup_entity: use {{name: "entity name", label: "NodeLabel"}} 
-- For impact_analysis: use {{entity_key: "id", entity_label: "NodeLabel", direction: "out", depth: 3}}
-- For customer_history: use {{customer_key: "customerID"}}
-- For co_purchase: use {{product_key: "productID"}}
-- For aggregate: use {{label: "NodeLabel", group_by: "property", metric: "sum_revenue"}}
-- For run_readonly_cypher: use {{query: "CYPHER QUERY"}}
+- For lookup_entity: use {{"name": "entity name", "label": "NodeLabel"}}
+- For impact_analysis: use {{"entity_key": "id", "entity_label": "NodeLabel", "direction": "out", "depth": 3}}
+- For customer_history: use {{"customer_key": "customerID"}}
+- For co_purchase: use {{"product_key": "productID"}}
+- For aggregate: use {{"label": "NodeLabel", "group_by": "property", "metric": "sum_revenue"}}
+- For run_readonly_cypher: use {{"query": "CYPHER QUERY"}}
 - json_arguments must be valid JSON
+- Use the key returned by lookup_entity, never a guessed key.
+- Exploratory Product queries must return productID and productName alongside measures so results can be cited.
+- Use run_readonly_cypher for ranked product revenue questions; aggregate is for group-by reporting.
 - Only use the tools listed above. Do NOT make up information.
 """
 
@@ -229,9 +232,30 @@ def generate_agent_response(question: str, messages: list[dict], available_tools
         {"role": "system", "content": system_prompt},
     ]
     for msg in messages:
-        role = msg.get('role', 'user')
-        content = msg.get('content', '')
-        mistral_messages.append({"role": role, "content": content})
+        if isinstance(msg, dict):
+            role = msg.get('role', 'user')
+            content = msg.get('content', '')
+        else:
+            role = 'assistant' if msg.type in ('ai', 'tool') else 'user'
+            content = msg.content
+            if msg.type == 'tool':
+                # User approved sending read-only Northwind results to Mistral
+                # on 2026-09-28. Revisit this data-sharing choice later.
+                import json
+                try:
+                    payload = json.loads(content)
+                    if msg.name == 'impact_analysis':
+                        payload = {
+                            'status': payload.get('status'),
+                            'anchor': payload.get('anchor'),
+                            'aggregates': payload.get('aggregates'),
+                            'subgraph_node_count': len(payload.get('subgraph', {}).get('nodes', [])),
+                            'subgraph_edge_count': len(payload.get('subgraph', {}).get('edges', [])),
+                        }
+                    content = f'Tool {msg.name} returned: {json.dumps(payload)}'
+                except (TypeError, ValueError):
+                    pass
+        mistral_messages.append({'role': role, 'content': str(content)})
     
     # Add current question
     mistral_messages.append({"role": "user", "content": question})
@@ -257,3 +281,22 @@ __all__ = [
     'classify_with_llm',
     'generate_agent_response',
 ]
+
+
+def synthesize_from_evidence(draft: str) -> str:
+    """Use Mistral Large to phrase a fully cited, locally grounded draft."""
+    response = get_mistral_client().chat.complete(
+        model=MODEL_AGENT,
+        messages=[
+            {"role": "system", "content": (
+                "You edit a Northwind graph answer. Preserve every citation marker exactly. "
+                "Do not add entities, numbers, dates, causes, or other facts. "
+                "Keep a citation marker on every factual sentence or bullet. "
+                "Return only the revised answer."
+            )},
+            {"role": "user", "content": draft},
+        ],
+        temperature=0.0,
+        max_tokens=1200,
+    )
+    return response.choices[0].message.content.strip()

@@ -15,12 +15,10 @@ SCHEMA.md Addendum (applied):
 - orderDate format: "1997-08-25 00:00:00.000" (with milliseconds)
 """
 
-import time
 from typing import Any, Optional
-from dataclasses import dataclass, asdict
 from enum import Enum
 
-from .client import client
+from .client import client, Neo4jClient
 
 
 # =============================================================================
@@ -107,442 +105,240 @@ def _filter_properties(props: dict, label: str) -> dict:
 # TOOL 1.1: lookup_entity
 # =============================================================================
 
+def _lookup_name_expression(label: str) -> str:
+    if label == "Employee":
+        return "trim(coalesce(n.firstName, '') + ' ' + coalesce(n.lastName, ''))"
+    if label == "Order":
+        return "toString(n.orderID)"
+    return f"n.{LABEL_TO_NAME[label]}"
+
+
 def lookup_entity(name: str, label: Optional[str] = None) -> dict:
-    """
-    Resolve a natural-language mention to graph nodes.
-    
-    Signature: lookup_entity(name: str, label: str | None = None) -> dict
-    Mode: retrieval (rubric-neutral)
-    Statuses: ok | empty | invalid
-    
-    Cascade order:
-    1. Exact match on label's name property
-    2. Case-insensitive contains on label's name property  
-    3. Fuzzy match (Levenshtein distance <= 1)
-    
-    Keys are SCHEMA.md key-property values (e.g., supplierID), not names.
-    Property subsets: Supplier = {country, phone}; Product = {unitPrice, unitsInStock}
-    Fuzzy calibration: "Exotic Liqids" (distance 1) must match; "NonExistentSupplier" must not.
-    """
-    # Validate label
+    """Resolve a mention across all nine labels with exact/contains/fuzzy tiers."""
     if label is not None and label not in VALID_LABELS:
         return {"status": "invalid", "query_name": name, "matches": []}
-    
-    # If no label, search all labels with name properties
-    labels_to_search = [label] if label else [
-        lbl for lbl in VALID_LABELS if LABEL_TO_NAME.get(lbl) is not None
-    ]
-    
-    matches: list[dict] = []
-    
-    # ===== TIER 1: Exact match =====
-    for lbl in labels_to_search:
-        name_prop = LABEL_TO_NAME.get(lbl)
-        key_prop = LABEL_TO_KEY.get(lbl)
-        if not name_prop or not key_prop:
-            continue
-        
-        # Select all properties for filtering later
-        query = f"MATCH (n:{lbl}) WHERE n.{name_prop} = $name RETURN n"
-        try:
-            records, _ = client.run_read_query(query, {"name": name})
-            for record in records:
-                node = record["n"]
-                props = {k: v for k, v in dict(node).items() if k != key_prop and k != name_prop}
-                matches.append({
-                    "label": lbl,
-                    "key": str(node.get(key_prop, "")),
-                    "name": str(node.get(name_prop, "")),
-                    "match": "exact",
-                    "properties": _filter_properties(props, lbl)
-                })
-        except Exception:
-            pass
-    
-    if matches:
-        return {
-            "status": "ok",
-            "query_name": name,
-            "matches": matches[:10]
-        }
-    
-    # ===== TIER 2: Case-insensitive contains =====
-    for lbl in labels_to_search:
-        name_prop = LABEL_TO_NAME.get(lbl)
-        key_prop = LABEL_TO_KEY.get(lbl)
-        if not name_prop or not key_prop:
-            continue
-        
-        query = f"MATCH (n:{lbl}) WHERE toLower(n.{name_prop}) CONTAINS toLower($name) RETURN n"
-        try:
-            records, _ = client.run_read_query(query, {"name": name})
-            for record in records:
-                node = record["n"]
-                props = {k: v for k, v in dict(node).items() if k != key_prop and k != name_prop}
-                matches.append({
-                    "label": lbl,
-                    "key": str(node.get(key_prop, "")),
-                    "name": str(node.get(name_prop, "")),
-                    "match": "contains",
-                    "properties": _filter_properties(props, lbl)
-                })
-        except Exception:
-            pass
-    
-    if matches:
-        return {
-            "status": "ok",
-            "query_name": name,
-            "matches": matches[:10]
-        }
-    
-    # ===== TIER 3: Fuzzy match =====
-    # Only if a specific label is provided (fuzzy across all labels is too expensive)
-    if label:
-        name_prop = LABEL_TO_NAME.get(label)
-        key_prop = LABEL_TO_KEY.get(label)
-        if name_prop and key_prop:
-            # Get all entities of this label
-            query = f"MATCH (n:{label}) RETURN n"
+    if not isinstance(name, str) or not name.strip():
+        return {"status": "invalid", "query_name": name, "matches": []}
+    labels = [label] if label else list(LABEL_TO_KEY)
+
+    def payload(node, node_label, tier):
+        props = dict(node)
+        key_prop = LABEL_TO_KEY[node_label]
+        if node_label == "Employee":
+            display_name = " ".join(filter(None, [props.get("firstName"), props.get("lastName")]))
+        elif node_label == "Order":
+            display_name = str(props.get("orderID", ""))
+        else:
+            display_name = str(props.get(LABEL_TO_NAME[node_label], ""))
+        remaining = {k: v for k, v in props.items() if k not in {key_prop, LABEL_TO_NAME.get(node_label)}}
+        return {"label": node_label, "key": str(props.get(key_prop, "")), "name": display_name,
+                "match": tier, "properties": _filter_properties(remaining, node_label)}
+
+    for tier in ("exact", "contains"):
+        found = []
+        for node_label in labels:
+            expression = _lookup_name_expression(node_label)
+            predicate = f"{expression} = $name" if tier == "exact" else f"toLower({expression}) CONTAINS toLower($name)"
+            query = f"MATCH (n:{node_label}) WHERE {predicate} RETURN n"
             try:
-                records, _ = client.run_read_query(query)
-                best_match = None
-                best_distance = float('inf')
-                
-                for record in records:
-                    node = record["n"]
-                    target_name = str(node.get(name_prop, ""))
-                    distance = _levenshtein(name.lower(), target_name.lower())
-                    if distance < best_distance:
-                        best_distance = distance
-                        best_match = node
-                
-                # Fuzzy calibration: edit distance 1 must match, but not more
-                if best_match and best_distance <= 1:
-                    props = {k: v for k, v in dict(best_match).items() if k != key_prop and k != name_prop}
-                    matches.append({
-                        "label": label,
-                        "key": str(best_match.get(key_prop, "")),
-                        "name": str(best_match.get(name_prop, "")),
-                        "match": "fuzzy",
-                        "properties": _filter_properties(props, label)
-                    })
-                    
-                if matches:
-                    return {
-                        "status": "ok",
-                        "query_name": name,
-                        "matches": matches[:10]
-                    }
+                rows, _ = client.run_read_query(query, {"name": name})
             except Exception:
-                pass
-    
-    return {"status": "empty", "query_name": name, "matches": []}
+                return {"status": "invalid", "query_name": name, "matches": []}
+            found.extend(payload(row["n"], node_label, tier) for row in rows)
+        if found:
+            return {"status": "ok", "query_name": name, "matches": found[:10]}
+
+    fuzzy = []
+    for node_label in labels:
+        try:
+            rows, _ = client.run_read_query(f"MATCH (n:{node_label}) RETURN n")
+        except Exception:
+            return {"status": "invalid", "query_name": name, "matches": []}
+        for row in rows:
+            match = payload(row["n"], node_label, "fuzzy")
+            distance = _levenshtein(name.lower(), match["name"].lower())
+            if distance <= 1:
+                fuzzy.append((distance, match))
+    fuzzy.sort(key=lambda item: (item[0], item[1]["name"], item[1]["label"]))
+    matches = [match for _, match in fuzzy[:10]]
+    return {"status": "ok" if matches else "empty", "query_name": name, "matches": matches}
 
 
 # =============================================================================
 # TOOL 1.2: impact_analysis
 # =============================================================================
 
+def _node_payload(node, label: str) -> dict:
+    props = dict(node)
+    key = str(props[LABEL_TO_KEY[label]])
+    if label == "Employee":
+        name = " ".join(filter(None, [props.get("firstName"), props.get("lastName")]))
+    elif label == "Order":
+        name = key
+    else:
+        name = str(props.get(LABEL_TO_NAME[label], key))
+    selected = {
+        "Supplier": {"country", "city", "phone"},
+        "Product": {"unitPrice", "unitsInStock", "discontinued"},
+        "Order": {"orderDate", "shipCountry"},
+        "Customer": {"country", "city"},
+    }.get(label)
+    if selected is not None:
+        props = {field: props[field] for field in selected if field in props}
+    return {"label": label, "key": key, "name": name, "properties": props}
+
+
 def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> dict:
-    """
-    From one anchor node, everything affected by its failure or removal.
-    
-    Signature: impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> dict
-    Mode: curated
-    Statuses: ok | empty | invalid
-    
-    Revenue rule: coalesce(line.unitPrice, p.unitPrice) * line.quantity
-    Traversal (depth 3, out): Supplier -[:SUPPLIES]-> Product <-[:ORDERS]- Order <-[:PURCHASED]- Customer
-    Null-quantity lines counted in unusable_lines, never silently dropped.
-    """
-    # Validate inputs
-    if direction not in ("out", "in"):
-        return {
-            "status": "invalid",
-            "anchor": None,
-            "subgraph": {"nodes": {}, "edges": {}},
-            "aggregates": {}
-        }
-    
-    if entity_label not in VALID_LABELS:
-        return {
-            "status": "invalid",
-            "anchor": None,
-            "subgraph": {"nodes": {}, "edges": {}},
-            "aggregates": {}
-        }
-    
-    key_prop = LABEL_TO_KEY.get(entity_label, "id")
-    
-    # ===== Supplier impact (depth 3, out) =====
-    # Pattern: Supplier -[:SUPPLIES]-> Product <-[:ORDERS]- Order <-[:PURCHASED]- Customer
-    # Subgraph includes SUPPLIES, ORDERS, and PURCHASED edges (all distinct node pairs)
-    if entity_label == "Supplier" and direction == "out" and depth == 3:
-        query = f"""
-        MATCH (s:Supplier {{{key_prop}: $entity_key}})-[:SUPPLIES]->(p:Product)<-[line:ORDERS]-(o:Order)<-[:PURCHASED]-(c:Customer)
-        RETURN 
-            s.{key_prop} AS s_key,
-            s.companyName AS s_name,
-            s.country AS s_country,
-            p.{LABEL_TO_KEY['Product']} AS p_key,
-            o.{LABEL_TO_KEY['Order']} AS o_key,
-            c.{LABEL_TO_KEY['Customer']} AS c_key,
-            line.unitPrice AS line_unitPrice,
-            line.quantity AS line_quantity,
-            p.unitPrice AS p_unitPrice
-        """
-        
-        try:
-            records, _ = client.run_read_query(query, {"entity_key": entity_key})
-            
-            if not records:
-                return {
-                    "status": "empty",
-                    "anchor": None,
-                    "subgraph": {"nodes": {}, "edges": {}},
-                    "aggregates": {"products_affected": 0, "orders_affected": 0, "revenue_at_risk": 0.0, "unusable_lines": 0}
-                }
-            
-            # Build subgraph counts
-            products = set()
+    """Return the actual evidence graph and revenue aggregates for an anchor."""
+    blank = {"nodes": [], "edges": []}
+    zero = {"products_affected": 0, "orders_affected": 0, "revenue_at_risk": 0.0, "unusable_lines": 0}
+    if entity_label not in {"Supplier", "Product", "Customer"} or direction not in {"out", "in"} or type(depth) is not int or not 1 <= depth <= 3:
+        return {"status": "invalid", "anchor": None, "subgraph": blank, "aggregates": zero}
+    key_property = LABEL_TO_KEY[entity_label]
+    anchor_query = f"MATCH (a:{entity_label} {{{key_property}: $key}}) RETURN a"
+    try:
+        anchors, _ = client.run_read_query(anchor_query, {"key": entity_key})
+        if not anchors:
+            return {"status": "empty", "anchor": None, "subgraph": blank, "aggregates": zero}
+        anchor = _node_payload(anchors[0]["a"], entity_label)
+        if direction == "in":
+            if entity_label != "Product":
+                return {"status": "empty", "anchor": anchor, "subgraph": {"nodes": [anchor], "edges": []}, "aggregates": zero}
+            rows, _ = client.run_read_query("""
+                MATCH (p:Product {productID: $key})
+                OPTIONAL MATCH (s:Supplier)-[:SUPPLIES]->(p)
+                OPTIONAL MATCH (o:Order)-[line:ORDERS]->(p)
+                OPTIONAL MATCH (c:Customer)-[:PURCHASED]->(o)
+                RETURN s, o, c, line
+            """, {"key": entity_key})
+            nodes = {("Product", anchor["key"]): anchor}
+            edges = {}
             orders = set()
-            customers = set()
-            total_revenue = 0.0
-            unusable_lines = 0
-            
-            anchor = {
-                "label": "Supplier",
-                "key": entity_key,
-                "name": "",
-                "country": ""
-            }
-            
-            # For distinct edge counting per contract rule:
-            # "edges count distinct node pairs, not traversal instances"
-            order_product_pairs = set()  # (order_key, product_key) for ORDERS
-            customer_order_pairs = set()  # (customer_key, order_key) for PURCHASED
-            supplier_product_pairs = set()  # (supplier_key, product_key) for SUPPLIES
-            
-            for record in records:
-                # Anchor (only once)
-                if anchor["name"] == "":
-                    anchor["name"] = str(record.get("s_name", ""))
-                    anchor["country"] = str(record.get("s_country", ""))
-                
-                # Collect unique nodes
-                p_key = str(record.get("p_key", "")) if record.get("p_key") else ""
-                o_key = str(record.get("o_key", "")) if record.get("o_key") else ""
-                c_key = str(record.get("c_key", "")) if record.get("c_key") else ""
-                s_key = entity_key
-                
-                if p_key:
-                    products.add(p_key)
-                    supplier_product_pairs.add((s_key, p_key))
-                if o_key:
-                    orders.add(o_key)
-                if c_key:
-                    customers.add(c_key)
-                
-                # Track distinct pairs for edges
-                if o_key and p_key:
-                    order_product_pairs.add((o_key, p_key))
-                if c_key and o_key:
-                    customer_order_pairs.add((c_key, o_key))
-                
-                # Revenue calculation: coalesce(line.unitPrice, p.unitPrice) * line.quantity
-                line_unitPrice = record.get("line_unitPrice")
-                line_quantity = record.get("line_quantity")
-                p_unitPrice = record.get("p_unitPrice")
-                
-                if line_quantity is None:
-                    unusable_lines += 1
-                elif line_unitPrice is not None:
-                    total_revenue += float(line_unitPrice) * float(line_quantity)
-                elif p_unitPrice is not None:
-                    total_revenue += float(p_unitPrice) * float(line_quantity)
-            
-            # Edge counts for subgraph
-            # Contract rule: edges count DISTINCT node pairs, not traversal instances
-            # SUPPLIES: distinct (Supplier, Product) pairs = 3
-            # ORDERS: distinct (Order, Product) pairs = 94 (each order line is unique)
-            # PURCHASED: distinct (Customer, Order) pairs = 90
-            # Note: 94 ORDERS vs 90 PURCHASED because 4 orders buy 2 supplier products each
-            edge_counts = {
-                "SUPPLIES": len(supplier_product_pairs),
-                "ORDERS": len(order_product_pairs),
-                "PURCHASED": len(customer_order_pairs)
-            }
-            
-            # Node counts for subgraph
-            node_counts = {
-                "Supplier": 1,
-                "Product": len(products),
-                "Order": len(orders),
-                "Customer": len(customers)
-            }
-            
-            return {
-                "status": "ok",
-                "anchor": anchor,
-                "subgraph": {
-                    "nodes": {k: v for k, v in node_counts.items() if v > 0},
-                    "edges": {k: v for k, v in edge_counts.items() if v > 0}
-                },
-                "aggregates": {
-                    "products_affected": len(products),
-                    "orders_affected": len(orders),
-                    "revenue_at_risk": round(total_revenue, 2),
-                    "unusable_lines": unusable_lines
-                }
-            }
-        except Exception as e:
-            return {
-                "status": "invalid",
-                "anchor": None,
-                "subgraph": {"nodes": {}, "edges": {}},
-                "aggregates": {}
-            }
-    
-    # ===== Product impact =====
-    elif entity_label == "Product" and direction == "out":
-        p_key_prop = LABEL_TO_KEY["Product"]
-        query = f"""
-        MATCH (p:Product {{{p_key_prop}: $entity_key}})<-[line:ORDERS]-(o:Order)<-[:PURCHASED]-(c:Customer)
-        RETURN 
-            p.{p_key_prop} AS p_key,
-            p.productName AS p_name,
-            o.{LABEL_TO_KEY['Order']} AS o_key,
-            c.{LABEL_TO_KEY['Customer']} AS c_key,
-            c.companyName AS c_name,
-            c.country AS c_country,
-            line.unitPrice AS line_unitPrice,
-            line.quantity AS line_quantity,
-            p.unitPrice AS p_unitPrice
-        """
-        
-        try:
-            records, _ = client.run_read_query(query, {"entity_key": entity_key})
-            
-            if not records:
-                return {
-                    "status": "empty",
-                    "anchor": None,
-                    "subgraph": {"nodes": {}, "edges": {}},
-                    "aggregates": {"products_affected": 0, "orders_affected": 0, "revenue_at_risk": 0.0, "unusable_lines": 0}
-                }
-            
-            anchor = {
-                "label": "Product",
-                "key": entity_key,
-                "name": str(records[0].get("p_name", ""))
-            }
-            
-            orders = set()
-            customers = set()
-            total_revenue = 0.0
-            unusable_lines = 0
-            
-            for record in records:
-                if record.get("o_key"):
-                    orders.add(str(record["o_key"]))
-                if record.get("c_key"):
-                    customers.add(str(record["c_key"]))
-                
-                line_unitPrice = record.get("line_unitPrice")
-                line_quantity = record.get("line_quantity")
-                p_unitPrice = record.get("p_unitPrice")
-                
-                if line_quantity is None:
-                    unusable_lines += 1
-                elif line_unitPrice is not None:
-                    total_revenue += float(line_unitPrice) * float(line_quantity)
-                elif p_unitPrice is not None:
-                    total_revenue += float(p_unitPrice) * float(line_quantity)
-            
-            return {
-                "status": "ok",
-                "anchor": anchor,
-                "subgraph": {
-                    "nodes": {"Product": 1, "Order": len(orders), "Customer": len(customers)},
-                    "edges": {"ORDERS": len(orders), "PURCHASED": len(orders)}
-                },
-                "aggregates": {
-                    "products_affected": 1,
-                    "orders_affected": len(orders),
-                    "revenue_at_risk": round(total_revenue, 2),
-                    "unusable_lines": unusable_lines
-                }
-            }
-        except Exception:
-            return {"status": "invalid", "anchor": None, "subgraph": {"nodes": {}, "edges": {}}, "aggregates": {}}
-    
-    # ===== Customer impact =====
-    elif entity_label == "Customer" and direction == "out":
-        c_key_prop = LABEL_TO_KEY["Customer"]
-        query = f"""
-        MATCH (c:Customer {{{c_key_prop}: $entity_key}})-[:PURCHASED]->(o:Order)-[:ORDERS]->(p:Product)<-[:SUPPLIES]-(s:Supplier)
-        RETURN 
-            c.{c_key_prop} AS c_key,
-            c.companyName AS c_name,
-            c.country AS c_country,
-            o.{LABEL_TO_KEY['Order']} AS o_key,
-            p.{LABEL_TO_KEY['Product']} AS p_key,
-            p.productName AS p_name,
-            s.{LABEL_TO_KEY['Supplier']} AS s_key,
-            s.companyName AS s_name,
-            s.country AS s_country
-        """
-        
-        try:
-            records, _ = client.run_read_query(query, {"entity_key": entity_key})
-            
-            if not records:
-                return {
-                    "status": "empty",
-                    "anchor": None,
-                    "subgraph": {"nodes": {}, "edges": {}},
-                    "aggregates": {"products_affected": 0, "orders_affected": 0, "revenue_at_risk": 0.0, "unusable_lines": 0}
-                }
-            
-            anchor = {
-                "label": "Customer",
-                "key": entity_key,
-                "name": str(records[0].get("c_name", "")),
-                "country": str(records[0].get("c_country", ""))
-            }
-            
-            orders = set()
-            products = set()
-            suppliers = set()
-            
-            for record in records:
-                if record.get("o_key"):
-                    orders.add(str(record["o_key"]))
-                if record.get("p_key"):
-                    products.add(str(record["p_key"]))
-                if record.get("s_key"):
-                    suppliers.add(str(record["s_key"]))
-            
-            return {
-                "status": "ok",
-                "anchor": anchor,
-                "subgraph": {
-                    "nodes": {"Customer": 1, "Order": len(orders), "Product": len(products), "Supplier": len(suppliers)},
-                    "edges": {"PURCHASED": len(orders), "ORDERS": len(products), "SUPPLIES": len(suppliers)}
-                },
-                "aggregates": {
-                    "products_affected": len(products),
-                    "orders_affected": len(orders),
-                    "revenue_at_risk": 0.0,  # Would need separate query for revenue
-                    "unusable_lines": 0
-                }
-            }
-        except Exception:
-            return {"status": "invalid", "anchor": None, "subgraph": {"nodes": {}, "edges": {}}, "aggregates": {}}
-    
-    # Generic fallback for other cases
-    return {"status": "invalid", "anchor": None, "subgraph": {"nodes": {}, "edges": {}}, "aggregates": {}}
+            revenue = 0.0
+            unusable = 0
+            for row in rows:
+                supplier_node, order_node, customer_node, line = (row.get(k) for k in ("s", "o", "c", "line"))
+                if supplier_node is not None:
+                    supplier = _node_payload(supplier_node, "Supplier")
+                    nodes[("Supplier", supplier["key"])] = supplier
+                    edges[("SUPPLIES", supplier["key"], anchor["key"])] = {
+                        "type": "SUPPLIES", "from": {"label": "Supplier", "key": supplier["key"]},
+                        "to": {"label": "Product", "key": anchor["key"]},
+                    }
+                if order_node is not None:
+                    order = _node_payload(order_node, "Order")
+                    orders.add(order["key"])
+                    nodes[("Order", order["key"])] = order
+                    edges[("ORDERS", order["key"], anchor["key"])] = {
+                        "type": "ORDERS", "from": {"label": "Order", "key": order["key"]},
+                        "to": {"label": "Product", "key": anchor["key"]},
+                    }
+                    if line is not None:
+                        quantity = dict(line).get("quantity")
+                        price = dict(line).get("unitPrice")
+                        if price is None:
+                            price = dict(anchors[0]["a"]).get("unitPrice")
+                        if quantity is None or price is None:
+                            unusable += 1
+                        else:
+                            revenue += float(price) * float(quantity)
+                if customer_node is not None and depth >= 2:
+                    customer = _node_payload(customer_node, "Customer")
+                    nodes[("Customer", customer["key"])] = customer
+                    edges[("PURCHASED", customer["key"], order["key"])] = {
+                        "type": "PURCHASED", "from": {"label": "Customer", "key": customer["key"]},
+                        "to": {"label": "Order", "key": order["key"]},
+                    }
+            aggregates = {"products_affected": 1, "orders_affected": len(orders),
+                          "revenue_at_risk": round(revenue, 2), "unusable_lines": unusable}
+            return {"status": "ok" if edges else "empty", "anchor": anchor,
+                    "subgraph": {"nodes": list(nodes.values()), "edges": list(edges.values())},
+                    "aggregates": aggregates}
+        if entity_label == "Supplier":
+            query = """
+                MATCH (s:Supplier {supplierID: $key})
+                OPTIONAL MATCH (s)-[:SUPPLIES]->(p:Product)
+                OPTIONAL MATCH (o:Order)-[line:ORDERS]->(p)
+                OPTIONAL MATCH (c:Customer)-[:PURCHASED]->(o)
+                RETURN p, o, c, line
+            """
+        elif entity_label == "Product":
+            query = """
+                MATCH (p:Product {productID: $key})
+                OPTIONAL MATCH (o:Order)-[line:ORDERS]->(p)
+                OPTIONAL MATCH (c:Customer)-[:PURCHASED]->(o)
+                RETURN p, o, c, line
+            """
+        else:
+            query = """
+                MATCH (c:Customer {customerID: $key})
+                OPTIONAL MATCH (c)-[:PURCHASED]->(o:Order)
+                OPTIONAL MATCH (o)-[line:ORDERS]->(p:Product)
+                RETURN p, o, c, line
+            """
+        rows, _ = client.run_read_query(query, {"key": entity_key})
+    except Exception:
+        return {"status": "invalid", "anchor": None, "subgraph": blank, "aggregates": zero}
+
+    nodes = {(anchor["label"], anchor["key"]): anchor}
+    edges = {}
+    products, orders = set(), set()
+    revenue = 0.0
+    unusable = 0
+    def add_node(node, label):
+        payload = _node_payload(node, label)
+        nodes[(label, payload["key"])] = payload
+        return payload
+    def add_edge(kind, start, end):
+        signature = (kind, start["label"], start["key"], end["label"], end["key"])
+        edges[signature] = {"type": kind, "from": {"label": start["label"], "key": start["key"]}, "to": {"label": end["label"], "key": end["key"]}}
+
+    for row in rows:
+        p_node, o_node, c_node, line = (row.get(k) for k in ("p", "o", "c", "line"))
+        p = o = c = None
+        if entity_label == "Supplier":
+            if p_node is not None and depth >= 1:
+                p = add_node(p_node, "Product")
+                products.add(p["key"])
+                add_edge("SUPPLIES", anchor, p)
+            if o_node is not None and depth >= 2:
+                o = add_node(o_node, "Order")
+                orders.add(o["key"])
+                add_edge("ORDERS", o, p)
+            if c_node is not None and depth >= 3:
+                c = add_node(c_node, "Customer")
+                add_edge("PURCHASED", c, o)
+        elif entity_label == "Product":
+            p = anchor
+            products.add(p["key"])
+            if o_node is not None and depth >= 1:
+                o = add_node(o_node, "Order")
+                orders.add(o["key"])
+                add_edge("ORDERS", o, p)
+            if c_node is not None and depth >= 2:
+                c = add_node(c_node, "Customer")
+                add_edge("PURCHASED", c, o)
+        else:
+            c = anchor
+            if o_node is not None and depth >= 1:
+                o = add_node(o_node, "Order")
+                orders.add(o["key"])
+                add_edge("PURCHASED", c, o)
+            if p_node is not None and depth >= 2:
+                p = add_node(p_node, "Product")
+                products.add(p["key"])
+                add_edge("ORDERS", o, p)
+        if line is not None and p is not None and o is not None:
+            quantity = dict(line).get("quantity")
+            price = dict(line).get("unitPrice")
+            if price is None:
+                price = dict(p_node).get("unitPrice")
+            if quantity is None or price is None:
+                unusable += 1
+            else:
+                revenue += float(price) * float(quantity)
+    aggregates = {"products_affected": len(products), "orders_affected": len(orders), "revenue_at_risk": round(revenue, 2), "unusable_lines": unusable}
+    return {"status": "ok" if edges else "empty", "anchor": anchor, "subgraph": {"nodes": list(nodes.values()), "edges": list(edges.values())}, "aggregates": aggregates}
 
 
 # =============================================================================
@@ -673,214 +469,231 @@ def customer_history(customer_key: str) -> dict:
 # TOOL 1.5: aggregate
 # =============================================================================
 
-# Whitelists for group_by validation
-SUPPLIER_WHITELIST = {
-    "country", "city", "supplierID", "companyName",
-    "contactName", "contactTitle", "address", "region",
-    "postalCode", "phone", "fax", "homePage"
+# Fixed, whitelisted aggregate projections. Each path is a curated traversal.
+AGGREGATE_PROPERTIES = {
+    "Supplier": {"country", "city", "supplierID", "companyName", "contactName", "contactTitle", "address", "region", "postalCode", "phone", "fax", "homePage"},
+    "Product": {"categoryID", "productID", "productName", "unitPrice", "unitsInStock", "discontinued", "reorderLevel", "unitsOnOrder"},
+    "Customer": {"customerID", "companyName", "country", "city", "region"},
+    "Employee": {"employeeID", "firstName", "lastName", "title", "country"},
+    "Category": {"categoryID", "categoryName"},
+    "Shipper": {"shipperID", "companyName"},
+    "Order": {"orderID", "orderDate", "shipCountry"},
+    "Territory": {"territoryID", "territoryDescription"},
+    "Region": {"regionID", "regionDescription"},
 }
 
-PRODUCT_WHITELIST = {
-    "categoryID", "productName", "unitPrice", "unitsInStock",
-    "discontinued", "reorderLevel", "unitsOnOrder"
+AGGREGATE_ALIASES = {
+    "Supplier": "s", "Product": "p", "Customer": "c", "Employee": "e",
+    "Category": "cat", "Shipper": "sh", "Order": "o", "Territory": "t", "Region": "r",
 }
 
-# Fixed join patterns per label for each metric
-# Supplier: Supplier -> SUPPLIES -> Product <- ORDERS <- Order
-# Product: Product <- ORDERS <- Order
-# Format: (match_clause, return_clause)
-
-JOIN_PATTERNS = {
-    ("Supplier", "sum_revenue"): (
-        "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[line:ORDERS]-(o:Order)",
-        "RETURN s.%s AS group_value, "
-        "sum(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS metric_value"
-    ),
-    ("Supplier", "count"): (
-        "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)",
-        "RETURN s.%s AS group_value, count(DISTINCT p) AS metric_value"
-    ),
-    ("Supplier", "avg_revenue"): (
-        "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[line:ORDERS]-(o:Order)",
-        "RETURN s.%s AS group_value, "
-        "avg(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS metric_value"
-    ),
-    ("Product", "sum_revenue"): (
-        "MATCH (p:Product)<-[line:ORDERS]-(o:Order)",
-        "RETURN p.%s AS group_value, "
-        "sum(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS metric_value"
-    ),
-    ("Product", "count"): (
-        "MATCH (p:Product)-[:PART_OF]->(c:Category)",
-        "RETURN c.%s AS group_value, count(p) AS metric_value"
-    ),
-    ("Product", "avg_revenue"): (
-        "MATCH (p:Product)<-[line:ORDERS]-(o:Order)",
-        "RETURN p.%s AS group_value, "
-        "avg(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS metric_value"
-    ),
+COUNT_PATHS = {
+    "Supplier": ("MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)", "count(DISTINCT p)"),
+    "Product": ("MATCH (p:Product)-[:PART_OF]->(c:Category)", "count(DISTINCT p)"),
+    "Customer": ("MATCH (c:Customer)-[:PURCHASED]->(o:Order)", "count(DISTINCT o)"),
+    "Employee": ("MATCH (e:Employee)-[:SOLD]->(o:Order)", "count(DISTINCT o)"),
+    "Category": ("MATCH (cat:Category)<-[:PART_OF]-(p:Product)<-[:ORDERS]-(o:Order)", "count(DISTINCT o)"),
+    "Shipper": ("MATCH (sh:Shipper)-[:SHIPS]->(o:Order)", "count(DISTINCT o)"),
+    "Order": ("MATCH (o:Order)-[:ORDERS]->(p:Product)", "count(DISTINCT p)"),
+    "Territory": ("MATCH (t:Territory)<-[:IN_TERRITORY]-(e:Employee)", "count(DISTINCT e)"),
+    "Region": ("MATCH (r:Region)<-[:IN_REGION]-(t:Territory)", "count(DISTINCT t)"),
 }
+
+REVENUE_PATHS = {
+    "Supplier": "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[line:ORDERS]-(o:Order)",
+    "Product": "MATCH (p:Product)<-[line:ORDERS]-(o:Order)",
+    "Customer": "MATCH (c:Customer)-[:PURCHASED]->(o:Order)-[line:ORDERS]->(p:Product)",
+    "Employee": "MATCH (e:Employee)-[:SOLD]->(o:Order)-[line:ORDERS]->(p:Product)",
+    "Category": "MATCH (cat:Category)<-[:PART_OF]-(p:Product)<-[line:ORDERS]-(o:Order)",
+    "Shipper": "MATCH (sh:Shipper)-[:SHIPS]->(o:Order)-[line:ORDERS]->(p:Product)",
+    "Order": "MATCH (o:Order)-[line:ORDERS]->(p:Product)",
+    "Territory": "MATCH (t:Territory)<-[:IN_TERRITORY]-(e:Employee)-[:SOLD]->(o:Order)-[line:ORDERS]->(p:Product)",
+    "Region": "MATCH (r:Region)<-[:IN_REGION]-(t:Territory)<-[:IN_TERRITORY]-(e:Employee)-[:SOLD]->(o:Order)-[line:ORDERS]->(p:Product)",
+}
+
+
+def _aggregate_filter_value(label: str, prop: str, value: str):
+    if value.startswith("'") and value.endswith("'"):
+        value = value[1:-1]
+    if label == "Product":
+        if prop == "unitPrice":
+            return float(value)
+        if prop in {"unitsInStock", "reorderLevel", "unitsOnOrder"}:
+            return int(value)
+        if prop == "discontinued":
+            if value.lower() not in {"true", "false"}:
+                raise ValueError("Invalid boolean filter")
+            return value.lower() == "true"
+    return value
 
 
 def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = None) -> dict:
-    """
-    Tabular executive questions: parameterized query builder over fixed join patterns.
-    
-    Signature: aggregate(label: str, group_by: str, metric: str, where: str | None = None) -> dict
-    Mode: curated
-    Statuses: ok | empty | invalid
-    
-    Metrics: count | sum_revenue | avg_revenue
-    group_values are always raw strings.
-    Type pinning: counts=integers, revenues=floats rounded to 2 decimals.
-    Whitelist validation on label, group_by, where.
-    """
-    # Validate label
-    if label not in VALID_LABELS:
-        return {"status": "invalid", "groups": [], "n_groups": 0}
-    
-    # Validate metric
-    if metric not in ("count", "sum_revenue", "avg_revenue"):
-        return {"status": "invalid", "groups": [], "n_groups": 0}
-    
-    # Validate group_by against whitelist
-    whitelist = SUPPLIER_WHITELIST if label == "Supplier" else PRODUCT_WHITELIST
+    """Run a fixed, parameterized aggregate with contributor node handles."""
+    invalid = {"status": "invalid", "groups": [], "n_groups": 0}
+    if label not in AGGREGATE_PROPERTIES or metric not in {"count", "sum_revenue", "avg_revenue"}:
+        return invalid
+    whitelist = AGGREGATE_PROPERTIES[label]
     if group_by not in whitelist:
-        return {"status": "invalid", "groups": [], "n_groups": 0}
-    
-    # Get query pattern
-    pattern_key = (label, metric)
-    if pattern_key not in JOIN_PATTERNS:
-        return {"status": "invalid", "groups": [], "n_groups": 0}
-    
-    match_clause, return_template = JOIN_PATTERNS[pattern_key]
-    return_clause = return_template % group_by
-    
-    # Build query: MATCH [WHERE] RETURN ORDER BY
-    query = match_clause
-    
-    # Apply where clause (MUST come between MATCH and RETURN)
-    if where:
-        # Extract property and value
-        if "=" in where:
-            prop, val = where.split("=", 1)
-            prop = prop.strip()
-            val = val.strip()
-            # Validate property is in the whitelist for this label
-            if prop in whitelist:
-                # Supplier pattern uses 's' alias, Product pattern uses 'p' alias
-                alias = "s" if label == "Supplier" else "p"
-                if val.startswith("'") and val.endswith("'"):
-                    where_clause = f"{alias}.{prop} = {val}"
-                else:
-                    where_clause = f"{alias}.{prop} = '{val}'"
-                query = f"{query} WHERE {where_clause}"
-            else:
-                return {"status": "invalid", "groups": [], "n_groups": 0}
-        else:
-            return {"status": "invalid", "groups": [], "n_groups": 0}
-    
-    # Add RETURN and ORDER BY
-    # Order by metric_value descending for revenue metrics, group_value ascending for count
-    if metric in ("sum_revenue", "avg_revenue"):
-        order_by = "ORDER BY metric_value DESC"
+        return invalid
+    alias = AGGREGATE_ALIASES[label]
+    if metric == "count":
+        match_clause, value_expr = COUNT_PATHS[label]
     else:
-        order_by = "ORDER BY group_value ASC"
-    query = f"{query} {return_clause} {order_by}"
-    
+        match_clause = REVENUE_PATHS[label]
+        revenue = "coalesce(line.unitPrice, p.unitPrice) * line.quantity"
+        value_expr = f"sum({revenue})" if metric == "sum_revenue" else f"avg({revenue})"
+    filter_prop = None
+    parameters = {}
+    if where is not None:
+        if "=" not in where:
+            return invalid
+        filter_prop, raw_value = (part.strip() for part in where.split("=", 1))
+        if filter_prop not in whitelist:
+            return invalid
+        try:
+            parameters["where_value"] = _aggregate_filter_value(label, filter_prop, raw_value)
+        except ValueError:
+            return invalid
+    if label == "Product" and metric != "count" and (group_by == "categoryID" or filter_prop == "categoryID"):
+        match_clause += " MATCH (p)-[:PART_OF]->(c:Category)"
+    group_alias = "c" if label == "Product" and group_by == "categoryID" else alias
+    filter_alias = "c" if label == "Product" and filter_prop == "categoryID" else alias
+    if filter_prop:
+        match_clause += f" WHERE {filter_alias}.{filter_prop} = $where_value"
+    if label == "Region" and metric != "count":
+        match_clause += " WITH DISTINCT r, line, p"
+    order_by = "metric_value DESC" if metric != "count" else "group_value ASC"
+    query = (
+        f"{match_clause} RETURN {group_alias}.{group_by} AS group_value, "
+        f"{value_expr} AS metric_value, collect(DISTINCT {alias}) AS evidence_nodes "
+        f"ORDER BY {order_by} LIMIT 20"
+    )
     try:
-        records, _ = client.run_read_query(query)
-        
+        records, _ = client.run_read_query(query, parameters)
         groups = []
         for record in records:
-            group_value = str(record["group_value"])
-            metric_value = record["metric_value"]
-            
-            # Type pinning
-            if metric == "count":
-                metric_value = int(metric_value)
-            else:
-                metric_value = round(float(metric_value), 2)
-            
+            handles = {}
+            for node in record.get("evidence_nodes", []):
+                payload = _node_payload(node, label)
+                handles[(payload["label"], payload["key"])] = {
+                    field: payload[field] for field in ("label", "key", "name")
+                }
+            raw_metric = record["metric_value"]
             groups.append({
-                "group_value": group_value,
-                "metric_value": metric_value
+                "group_value": str(record["group_value"]),
+                "metric_value": int(raw_metric) if metric == "count" else round(float(raw_metric), 2),
+                "evidence": list(handles.values()),
             })
-        
-        return {
-            "status": "ok",
-            "groups": groups,  # Return all groups (ground truth has 21)
-            "n_groups": len(groups)
-        }
-        
-    except Exception as e:
-        return {"status": "invalid", "groups": [], "n_groups": 0}
+        return {"status": "ok" if groups else "empty", "groups": groups, "n_groups": len(groups)}
+    except Exception:
+        return invalid
 
 
 # =============================================================================
 # TOOL 2.1: run_readonly_cypher (Phase 2)
 # =============================================================================
 
+def _repair_cypher(query: str, error: str) -> str:
+    """Ask the large model for one corrected read query using the schema contract."""
+    from src.agents.llm import get_mistral_client, MODEL_AGENT
+    from src.agents.schema_prompt import generate_schema_prompt
+
+    prompt = (
+        "Repair this one read-only Cypher query for the Northwind graph. "
+        "Return only the corrected Cypher, with no markdown or explanation. "
+        "Use only the supplied schema and preserve the question's intent.\n\n"
+        f"Schema:\n{generate_schema_prompt()}\n\n"
+        f"Failed query:\n{query}\n\nError:\n{error}"
+    )
+    response = get_mistral_client().chat.complete(
+        model=MODEL_AGENT,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=700,
+    )
+    candidate = response.choices[0].message.content.strip()
+    if candidate.startswith("```"):
+        candidate = candidate.split("\n", 1)[-1].rsplit("```", 1)[0].strip()
+    return candidate
+
+
+def _cypher_json(value):
+    if hasattr(value, "labels"):
+        labels = sorted(value.labels)
+        label = labels[0] if labels else ""
+        if label in LABEL_TO_KEY:
+            return _node_payload(value, label)
+        return dict(value)
+    if isinstance(value, dict):
+        return {k: _cypher_json(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_cypher_json(v) for v in value]
+    return value
+
+
+def _validate_schema_cypher(query: str) -> str | None:
+    """Return an error for identifiers outside the SCHEMA.md universe."""
+    import re
+    from src.agents.schema_prompt import get_labels, get_relationships
+
+    if "`" in query:
+        return "Backtick identifiers are not part of the Northwind schema"
+    code = Neo4jClient._mask_literals_and_comments(query)
+    labels = {item["label"]: set(item["properties"]) | {item["key"]} for item in get_labels()}
+    relationships = {item["type"]: set(item["properties"]) for item in get_relationships()}
+    aliases = {}
+    for match in re.finditer(r"\(\s*([A-Za-z_][\w]*)\s*:\s*([A-Za-z_][\w]*)", code):
+        alias, label = match.groups()
+        if label not in labels:
+            return f"Unknown node label: {label}"
+        aliases[alias] = labels[label]
+    for match in re.finditer(r"\(\s*:\s*([A-Za-z_][\w]*)", code):
+        if match.group(1) not in labels:
+            return f"Unknown node label: {match.group(1)}"
+    for match in re.finditer(r"\[\s*([A-Za-z_][\w]*)\s*:\s*([A-Za-z_][\w]*)", code):
+        alias, kind = match.groups()
+        if kind not in relationships:
+            return f"Unknown relationship type: {kind}"
+        aliases[alias] = relationships[kind]
+    for match in re.finditer(r"\[\s*:\s*([A-Za-z_][\w]*)", code):
+        if match.group(1) not in relationships:
+            return f"Unknown relationship type: {match.group(1)}"
+    for alias, prop in re.findall(r"\b([A-Za-z_][\w]*)\.([A-Za-z_][\w]*)\b", code):
+        if alias not in aliases or prop not in aliases[alias]:
+            return f"Unknown property: {alias}.{prop}"
+    return None
+
+
 def run_readonly_cypher(query: str) -> dict:
-    """
-    Agent-written Cypher with read-only guard, EXPLAIN validation, and 1 retry.
-    
-    Signature: run_readonly_cypher(query: str) -> dict
-    Mode: exploratory
-    Statuses: ok | empty | invalid | retry_ok | retry_failed
-    
-    Pipeline: read-only guard -> EXPLAIN validation -> execute -> return rows.
-    Exactly ONE retry on validation or execution failure.
-    """
+    """Validate, run, and at most once repair a read-only Cypher query."""
     attempts = []
-    
-    def attempt(query_str: str) -> dict:
-        # Read-only guard
+    if not client._validate_read_only(query):
+        attempts.append({"cypher": query, "valid": False, "error": "Only one read-only query is allowed"})
+        return {"status": "invalid", "query": query, "attempts": attempts, "rows": []}
+    candidate = query
+    for index in range(2):
+        if index == 1:
+            try:
+                candidate = _repair_cypher(query, attempts[0]["error"])
+            except Exception as exc:
+                attempts.append({"cypher": query, "valid": False, "error": f"Repair unavailable: {exc}"})
+                break
+        if not client._validate_read_only(candidate):
+            attempts.append({"cypher": candidate, "valid": False, "error": "Repair is not a single read-only query"})
+            break
         try:
-            if not client._validate_read_only(query_str):
-                return {"cypher": query_str, "valid": False, "error": "Read-only violation"}
-        except Exception as e:
-            return {"cypher": query_str, "valid": False, "error": str(e)}
-        
-        # EXPLAIN validation
-        try:
-            if not client.explain(query_str):
-                return {"cypher": query_str, "valid": False, "error": "EXPLAIN validation failed"}
-        except Exception as e:
-            return {"cypher": query_str, "valid": False, "error": str(e)}
-        
-        # Valid
-        return {"cypher": query_str, "valid": True, "error": None}
-    
-    # First attempt
-    first = attempt(query)
-    attempts.append(first)
-    
-    if first["valid"]:
-        records, _ = client.run_read_query(query)
-        return {
-            "status": "ok",
-            "query": query,
-            "attempts": attempts,
-            "rows": [dict(r) for r in records]
-        }
-    
-    # Retry once
-    second = attempt(query)
-    attempts.append(second)
-    
-    if second["valid"]:
-        records, _ = client.run_read_query(query)
-        return {
-            "status": "retry_ok",
-            "query": query,
-            "attempts": attempts,
-            "rows": [dict(r) for r in records]
-        }
-    else:
-        return {
-            "status": "retry_failed",
-            "query": query,
-            "attempts": attempts,
-            "rows": []
-        }
+            schema_error = _validate_schema_cypher(candidate)
+            if schema_error:
+                raise ValueError(schema_error)
+            if not client.explain(candidate):
+                raise ValueError("EXPLAIN validation failed")
+            records, _ = client.run_read_query(candidate)
+            attempts.append({"cypher": candidate, "valid": True, "error": None})
+            rows = [_cypher_json(dict(record)) for record in records]
+            return {
+                "status": ("retry_ok" if index else "ok") if rows else "empty",
+                "query": query, "attempts": attempts, "rows": rows,
+            }
+        except Exception as exc:
+            attempts.append({"cypher": candidate, "valid": False, "error": str(exc)})
+    return {"status": "retry_failed", "query": query, "attempts": attempts, "rows": []}

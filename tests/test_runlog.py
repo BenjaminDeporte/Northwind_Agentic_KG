@@ -17,27 +17,9 @@ from src.utils.runlog import write_run, read_runlog, clear_runlog, RUNLOG_PATH
 
 
 @pytest.fixture(autouse=True)
-def setup_teardown_runlog():
-    """Setup and teardown for runlog tests."""
-    # Save original path
-    original_path = os.environ.get("RUNLOG_PATH")
-    
-    # Use a temp file for testing
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as f:
-        temp_path = f.name
-    
-    os.environ["RUNLOG_PATH"] = temp_path
-    
-    yield
-    
-    # Cleanup
-    if original_path:
-        os.environ["RUNLOG_PATH"] = original_path
-    else:
-        os.environ.pop("RUNLOG_PATH", None)
-    
-    if os.path.exists(temp_path):
-        os.remove(temp_path)
+def setup_teardown_runlog(tmp_path, monkeypatch):
+    """Point the module constant at an isolated temporary log for every test."""
+    monkeypatch.setattr("src.utils.runlog.RUNLOG_PATH", str(tmp_path / "runlog.jsonl"))
 
 
 class TestWriteRun:

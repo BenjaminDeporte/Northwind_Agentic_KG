@@ -49,7 +49,18 @@ class TestImpactAnalysis:
             direction="out",
             depth=3
         )
-        assert result == GT_1_2_1, f"Expected:\n{json.dumps(GT_1_2_1, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
+        assert result["status"] == "ok"
+        assert result["aggregates"] == GT_1_2_1["aggregates"]
+        nodes = result["subgraph"]["nodes"]
+        edges = result["subgraph"]["edges"]
+        from collections import Counter
+        assert dict(Counter(node["label"] for node in nodes)) == GT_1_2_1["subgraph"]["nodes"]
+        assert dict(Counter(edge["type"] for edge in edges)) == GT_1_2_1["subgraph"]["edges"]
+        handles = {(node["label"], node["key"]) for node in nodes}
+        assert len(handles) == len(nodes)
+        for edge in edges:
+            assert (edge["from"]["label"], edge["from"]["key"]) in handles
+            assert (edge["to"]["label"], edge["to"]["key"]) in handles
 
     def test_aggregates_types(self):
         """Verify aggregate value types: products=int, orders=int, revenue=float, unusable=int."""
@@ -79,7 +90,7 @@ class TestImpactAnalysis:
         assert anchor["label"] == "Supplier"
         assert anchor["key"] == "1"
         assert anchor["name"] == "Exotic Liquids"
-        assert anchor["country"] == "UK"
+        assert anchor["properties"]["country"] == "UK"
 
     def test_empty_result(self):
         """Non-existent entity returns empty aggregates."""
@@ -113,3 +124,14 @@ class TestImpactAnalysis:
             depth=3
         )
         assert result["aggregates"]["revenue_at_risk"] == 35916.8
+
+
+def test_incoming_product_impact_respects_depth():
+    shallow = impact_analysis("1", "Product", direction="in", depth=1)
+    deep = impact_analysis("1", "Product", direction="in", depth=2)
+    assert shallow["status"] == deep["status"] == "ok"
+    assert {node["label"] for node in shallow["subgraph"]["nodes"]} == {"Product", "Supplier", "Order"}
+    assert "Customer" in {node["label"] for node in deep["subgraph"]["nodes"]}
+    assert shallow["aggregates"]["orders_affected"] == deep["aggregates"]["orders_affected"]
+    assert shallow["aggregates"]["revenue_at_risk"] == deep["aggregates"]["revenue_at_risk"]
+    assert shallow["aggregates"]["revenue_at_risk"] > 0

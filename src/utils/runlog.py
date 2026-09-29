@@ -14,6 +14,8 @@ Invariants:
 
 import json
 import os
+import tempfile
+from pathlib import Path
 from datetime import datetime, timezone
 from typing import Any
 
@@ -115,8 +117,11 @@ def clear_runlog() -> None:
     
     WARNING: This violates the append-only invariant. Use only in tests.
     """
-    if os.path.exists(RUNLOG_PATH):
-        os.remove(RUNLOG_PATH)
+    target = Path(RUNLOG_PATH).resolve()
+    if not target.is_relative_to(Path(tempfile.gettempdir()).resolve()):
+        raise ValueError("clear_runlog is restricted to temporary test logs")
+    if target.exists():
+        target.unlink()
 
 
 # =============================================================================

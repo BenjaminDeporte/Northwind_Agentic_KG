@@ -14,6 +14,7 @@ Invariants:
 """
 
 from typing import Annotated, TypedDict, Optional
+from langgraph.graph.message import add_messages
 
 
 # =============================================================================
@@ -76,7 +77,7 @@ class AgentState(TypedDict):
     """
     question: str
     route: str                      # "agent" | "chitchat" | "refusal" | "degrade"
-    messages: Annotated[list, "add_messages"]  # ONLY field with a reducer
+    messages: Annotated[list, add_messages]  # ONLY field with a reducer
     trace: list[ToolCallRecord]
     answer: str
     citations: list[Citation]

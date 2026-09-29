@@ -35,10 +35,9 @@ GT_1_5_1 = {
         {"group_value": "Spain", "metric_value": 26768.8},
         {"group_value": "Denmark", "metric_value": 10884.5},
         {"group_value": "71300", "metric_value": 6664.75},
-        {"group_value": "Netherlands", "metric_value": 5901.35},
-        {"group_value": "Brazil", "metric_value": 4782.6}
+        {"group_value": "Netherlands", "metric_value": 5901.35}
     ],
-    "n_groups": 21
+    "n_groups": 20
 }
 
 GT_1_5_2 = {
@@ -83,6 +82,15 @@ GT_1_5_4 = {
 # 6. Mutual consistency: UK total = GT 1.2.1's Exotic Liquids figure (35916.8)
 
 
+def _facts(result):
+    """Compare numeric ground truth while separately checking provenance."""
+    return {
+        "status": result["status"],
+        "groups": [{"group_value": g["group_value"], "metric_value": g["metric_value"]} for g in result["groups"]],
+        "n_groups": result["n_groups"],
+    }
+
+
 class TestAggregate:
     """Test aggregate tool against live AuraDB."""
 
@@ -93,7 +101,12 @@ class TestAggregate:
             group_by="country",
             metric="sum_revenue"
         )
-        assert result == GT_1_5_1, f"Expected:\n{json.dumps(GT_1_5_1, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
+        assert _facts(result) == GT_1_5_1, f"Expected:\n{json.dumps(GT_1_5_1, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
+        for group in result["groups"]:
+            handles = {(item["label"], item["key"]) for item in group["evidence"]}
+            assert handles and len(handles) == len(group["evidence"])
+            assert all(item["label"] == "Supplier" and item["name"] for item in group["evidence"])
+        assert ("Supplier", "1") in {(item["label"], item["key"]) for group in result["groups"] for item in group["evidence"]}
 
     def test_1_5_2_product_count_by_category(self):
         """GT 1.5.2: Product count by categoryID."""
@@ -102,7 +115,7 @@ class TestAggregate:
             group_by="categoryID",
             metric="count"
         )
-        assert result == GT_1_5_2, f"Expected:\n{json.dumps(GT_1_5_2, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
+        assert _facts(result) == GT_1_5_2, f"Expected:\n{json.dumps(GT_1_5_2, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
 
     def test_1_5_3_invalid_group_by(self):
         """GT 1.5.3: Invalid group_by property."""
@@ -121,7 +134,7 @@ class TestAggregate:
             metric="sum_revenue",
             where="country='UK'"
         )
-        assert result == GT_1_5_4, f"Expected:\n{json.dumps(GT_1_5_4, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
+        assert _facts(result) == GT_1_5_4, f"Expected:\n{json.dumps(GT_1_5_4, indent=2)}\nGot:\n{json.dumps(result, indent=2)}"
 
     def test_group_value_types(self):
         """group_value fields are always strings."""
@@ -219,3 +232,20 @@ class TestAggregate:
             metric="sum_revenue"
         )
         assert result["status"] == "invalid"
+
+
+def test_all_schema_labels_have_fixed_count_and_revenue_paths():
+    cases = [
+        ("Supplier", "country"), ("Product", "categoryID"),
+        ("Customer", "country"), ("Employee", "employeeID"),
+        ("Category", "categoryName"), ("Shipper", "companyName"),
+        ("Order", "shipCountry"), ("Territory", "territoryDescription"),
+        ("Region", "regionDescription"),
+    ]
+    for label, group_by in cases:
+        for metric in ("count", "sum_revenue"):
+            result = aggregate(label, group_by, metric)
+            assert result["status"] == "ok", (label, metric, result)
+            assert 0 < result["n_groups"] <= 20
+            assert all(group["evidence"] for group in result["groups"])
+            assert all(node["label"] == label for group in result["groups"] for node in group["evidence"])

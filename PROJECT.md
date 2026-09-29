@@ -200,7 +200,7 @@ Note the exploratory tool takes a raw string — the agent cannot bind Cypher pa
 
 **Semantics.** Tabular executive questions: "revenue by country", "top categories by order volume". A parameterized query builder over fixed join patterns — NOT a text-to-Cypher backdoor. `label` ∈ the nine labels; `group_by` ∈ a whitelisted property or joined label; `metric` ∈ {"count", "sum_revenue", "avg_revenue"}; `where` is a whitelisted equality filter.
 
-**Output schema.** `{ status, groups: [{ group_value, metric_value }], n_groups }` — capped at 20 groups.
+**Output schema.** `{ status, groups: [{ group_value, metric_value, evidence: [{ label, key, name }] }], n_groups }` — capped at 20 groups. `evidence` contains the canonical handles of every anchor-label node contributing to that group, deduplicated by label and key. This lets synthesis cite aggregate claims without inventing nodes.
 
 **Invariants.** (1) Fixed join patterns per label (curated traversals, parameterized projection only). (2) Property whitelist; anything else returns status "invalid". (3) sum_revenue uses the revenue rule. (4) Read-only.
 
@@ -210,8 +210,10 @@ Note the exploratory tool takes a raw string — the agent cannot bind Cypher pa
 
 ```json
 { "status": "ok",
-  "groups": [ { "group_value": "USA", "metric_value": 58000.0 },
-              { "group_value": "UK", "metric_value": 24000.0 } ],
+  "groups": [ { "group_value": "USA", "metric_value": 58000.0,
+                "evidence": [{ "label": "Supplier", "key": "2", "name": "New Orleans Cajun Delights" }] },
+              { "group_value": "UK", "metric_value": 24000.0,
+                "evidence": [{ "label": "Supplier", "key": "1", "name": "Exotic Liquids" }] } ],
   "n_groups": 2 }
 ```
 

@@ -158,3 +158,25 @@ class TestLookupEntity:
         result = lookup_entity(name="test", label="InvalidLabel")
         assert result["status"] == "invalid"
         assert result["matches"] == []
+
+
+def test_unlabeled_lookup_includes_employee_full_names():
+    from unittest.mock import patch
+    def query(cypher, parameters=None):
+        if "MATCH (n:Employee)" in cypher and "WHERE" in cypher:
+            return ([{"n": {"employeeID": "1", "firstName": "Nancy", "lastName": "Davolio"}}], None)
+        return ([], None)
+    with patch("src.neo4j.tools.client.run_read_query", side_effect=query):
+        result = lookup_entity("Nancy Davolio")
+    assert any(item["label"] == "Employee" and item["name"] == "Nancy Davolio" for item in result["matches"])
+
+
+def test_unlabeled_lookup_includes_order_ids():
+    from unittest.mock import patch
+    def query(cypher, parameters=None):
+        if "MATCH (n:Order)" in cypher and "WHERE" in cypher:
+            return ([{"n": {"orderID": "10248"}}], None)
+        return ([], None)
+    with patch("src.neo4j.tools.client.run_read_query", side_effect=query):
+        result = lookup_entity("10248")
+    assert any(item["label"] == "Order" and item["key"] == "10248" for item in result["matches"])

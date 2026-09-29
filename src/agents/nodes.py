@@ -212,842 +212,284 @@ def _classify_with_regex(state: AgentState) -> AgentState:
     }
 
 
-# =============================================================================
-# NODE 2.5: tools dispatcher
-# =============================================================================
+from uuid import uuid4
+from langchain_core.messages import AIMessage, ToolMessage
 
-def tools_dispatcher(
-    state: AgentState,
-    tool_name: str,
-    tool_func: ToolFunc,
-    step: int,
-    args: dict
-) -> tuple[AgentState, dict]:
-    """
-    Dispatch a single tool call, time it, append ToolCallRecord to trace.
-    
-    Contract: PROJECT.md §2, PLAN.md 2.5
-    
-    Args:
-        state: Current agent state
-        tool_name: Name of the tool to call
-        tool_func: The tool function to execute
-        step: 1-based loop iteration
-        args: Arguments to pass to the tool
-    
-    Returns:
-        Tuple of (updated_state, tool_result)
-    
-    Invariants:
-    - Exactly ONE ToolCallRecord appended to trace
-    - No silent calls
-    - Latency measured and recorded
-    - retry_count tracked (0 or 1)
-    """
-    # Determine mode based on tool name
-    mode = _get_tool_mode(tool_name)
-    
-    # Execute tool and time it
-    start_time = time.time()
-    tool_result = tool_func(**args)
-    elapsed_ms = int((time.time() - start_time) * 1000)
-    
-    # Extract result info
-    status = tool_result.get('status', 'unknown')
-    # Calculate result_rows based on tool type
-    if tool_name == 'lookup_entity':
-        result_rows = len(tool_result.get('matches', []))
-    elif tool_name == 'impact_analysis':
-        # For impact_analysis, use the number of products affected or orders affected
-        aggregates = tool_result.get('aggregates', {})
-        result_rows = aggregates.get('products_affected', 0) + aggregates.get('orders_affected', 0)
-    elif tool_name == 'co_purchase':
-        result_rows = len(tool_result.get('recommendations', []))
-    elif tool_name == 'customer_history':
-        result_rows = len(tool_result.get('orders', []))
-    elif tool_name == 'aggregate':
-        result_rows = len(tool_result.get('groups', []))
-    elif tool_name == 'run_readonly_cypher':
-        result_rows = len(tool_result.get('rows', []))
-    else:
-        result_rows = 0
-    cypher = tool_result.get('cypher', None) if mode == MODE_EXPLORATORY else None
-    
-    # Build ToolCallRecord (contractual fields only - no result)
-    record: ToolCallRecord = {
-        'step': step,
-        'tool_name': tool_name,
-        'args': args,
-        'mode': mode,
-        'status': status,
-        'result_rows': result_rows,
-        'cypher': cypher,
-        'latency_ms': elapsed_ms,
-        'retry_count': 0,  # Will be set to 1 if retry happens in tool itself
-    }
-    
-    # Append record to trace
-    trace = state.get('trace', [])
-    updated_trace = trace + [record]
-    
-    # Update state
-    updated_state = {
-        **state,
-        'trace': updated_trace,
-    }
-    
-    return (updated_state, tool_result)
+TOOL_MODES = {
+    "lookup_entity": MODE_RETRIEVAL,
+    "impact_analysis": MODE_CURATED,
+    "co_purchase": MODE_CURATED,
+    "customer_history": MODE_CURATED,
+    "aggregate": MODE_CURATED,
+    "run_readonly_cypher": MODE_EXPLORATORY,
+}
 
 
 def _get_tool_mode(tool_name: str) -> str:
-    """Determine tool mode based on name."""
-    curated_tools = {
-        'lookup_entity',
-        'impact_analysis', 
-        'co_purchase',
-        'customer_history',
-        'aggregate',
-    }
-    exploratory_tools = {
-        'run_readonly_cypher',
-    }
-    retrieval_tools = {
-        'lookup_entity',
-    }
-    
-    if tool_name in retrieval_tools:
-        return MODE_RETRIEVAL
-    elif tool_name in curated_tools:
-        return MODE_CURATED
-    elif tool_name in exploratory_tools:
-        return MODE_EXPLORATORY
-    else:
-        # Default to curated for unknown tools
-        return MODE_CURATED
-
-
-# =============================================================================
-# NODE 2.4: agent (ReAct loop)
-# =============================================================================
-
-def agent(state: AgentState, tools: dict[str, ToolFunc]) -> AgentState:
-    """
-    ReAct loop node - SINGLE ITERATION per graph call.
-    
-    Contract: PROJECT.md §2, PLAN.md 2.4
-    
-    This node performs ONE iteration of the ReAct loop per invocation.
-    The graph has a self-loop edge (agent → agent) that allows multiple iterations.
-    
-    Each iteration:
-    1. Checks loop_count against MAX_STEPS (if exceeded, sets route to DEGRADE)
-    2. Uses LLM to generate next step (ReAct: THINK -> TOOL -> observe)
-    3. Parses and dispatches ONE tool call
-    4. Updates state with tool result and increments loop_count
-    5. Returns updated state
-    
-    The graph's conditional edges will check:
-    - If answer is ready → route to synthesize
-    - If loop_count >= MAX_STEPS → route to degrade
-    - Otherwise → loop back to agent
-    
-    MAX_STEPS=8. All 6 tools bound. Emits tool calls. 
-    Terminates on answer or budget exhaustion.
-    
-    Control-flow invariants:
-    - MAX_STEPS=8
-    - Budget exhaustion routes to degrade, never to synthesize
-    - Every executed tool call appends exactly one ToolCallRecord
-    - No silent tool calls
-    
-    Uses Mistral large model per PROJECT.md: "Mistral models: large for agent"
-    Falls back to deterministic tool selection if LLM is unavailable.
-    """
-    question = state.get('question', '')
-    route = state.get('route', '')
-    loop_count = state.get('loop_count', 0)
-    trace = state.get('trace', [])
-    messages = state.get('messages', [])
-    
-    # Check for budget exhaustion - return with DEGRADE route
-    if loop_count >= MAX_STEPS:
-        return {
-            **state,
-            'route': ROUTE_DEGRADE,
-            'error': f'Budget exhausted: loop_count={loop_count} >= MAX_STEPS={MAX_STEPS}',
-        }
-    
-    # Update loop count for this iteration
-    new_loop_count = loop_count + 1
-    
-    # Try LLM-based ReAct loop first (Gate 1+)
-    try:
-        return _agent_iteration_with_llm(state, tools, new_loop_count)
-    except (ValueError, ImportError, Exception) as e:
-        # Fallback to deterministic tool selection for Phase 2 testing
-        # BUT: We MUST disclose this fallback for transparency
-        result = _agent_iteration_deterministic(state, tools, new_loop_count)
-        
-        # Add error to disclose degraded routing if not already set
-        if not result.get('error'):
-            result['error'] = f'agent: LLM unavailable, using deterministic fallback. Original error: {str(e)[:200]}'
-        
-        return result
-
-
-def _agent_iteration_with_llm(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
-    """
-    Perform ONE iteration of LLM-based ReAct loop.
-    
-    This performs:
-    1. LLM generates reasoning + tool call
-    2. Parse the tool call
-    3. Execute the tool via tools_dispatcher
-    4. Add both the LLM response and tool result to messages for next iteration
-    5. Update state and return
-    """
-    from .llm import generate_agent_response
-    
-    question = state.get('question', '')
-    messages = state.get('messages', [])
-    trace = state.get('trace', [])
-    
-    # Generate LLM response
-    # Pass the full conversation history (including previous tool results)
-    llm_response = generate_agent_response(
-        question=question,
-        messages=messages,
-        available_tools=list(tools.keys())
-    )
-    
-    # Parse the response for tool calls
-    # Expected format: THINK: ...\nTOOL: tool_name(json_args)
-    tool_call = _parse_llm_tool_call(llm_response)
-    
-    if not tool_call:
-        # LLM didn't request a tool call - check if it provided a final answer
-        if 'FINAL:' in llm_response.upper():
-            # Extract final answer - this is the terminal signal
-            final_answer = llm_response.split('FINAL:')[-1].strip()
-            # DON'T increment loop_count when we have the answer
-            # This ensures loop_count < MAX_STEPS so graph routes to synthesize
-            return {
-                **state,
-                'loop_count': state.get('loop_count', 0),  # Keep the same loop_count
-                'answer': final_answer,
-            }
-        else:
-            # No tool call and no final answer - fall back to deterministic tool selection
-            # This can happen when LLM is unsure or needs more context
-            return _agent_iteration_deterministic(state, tools, new_loop_count)
-    
-    # Execute the tool call
-    tool_name = tool_call['tool']
-    tool_args = tool_call['args']
-    
-    if tool_name not in tools:
-        return {
-            **state,
-            'loop_count': new_loop_count,
-            'error': f'Tool {tool_name} not available',
-        }
-    
-    # Dispatch tool call
-    tool_func = tools[tool_name]
-    updated_state, tool_result = tools_dispatcher(
-        state, tool_name, tool_func, new_loop_count, tool_args
-    )
-    
-    # Update loop count in the returned state
-    updated_state['loop_count'] = new_loop_count
-    
-    # Store tool result in messages for context and potential reuse
-    # Note: Use 'assistant' role for Mistral API compatibility (no 'tool' role support)
-    llm_message = {
-        'role': 'assistant',
-        'content': llm_response,
-    }
-    tool_message = {
-        'role': 'assistant',
-        'content': f"Tool {tool_name} returned: {json.dumps(tool_result)}",
-        'tool_name': tool_name,
-        'tool_result': tool_result,
-    }
-    updated_state['messages'] = messages + [llm_message, tool_message]
-    
-    # Don't set answer here - let the deterministic/LLM logic decide when we have enough
-    # The graph will continue looping until agent decides to set an answer
-    return updated_state
-
-
-def _agent_iteration_deterministic(state: AgentState, tools: dict[str, ToolFunc], new_loop_count: int) -> AgentState:
-    """
-    Perform ONE iteration of deterministic tool selection.
-    
-    This is the fallback when LLM is unavailable.
-    It calls ONE tool per iteration based on a deterministic plan.
-    """
-    question = state.get('question', '')
-    trace = state.get('trace', [])
-    messages = state.get('messages', [])
-    
-    # Check what tools have already been called
-    called_tools = {r['tool_name'] for r in trace}
-    
-    # Determine what tool to call next based on question and trace
-    next_tool_call = _get_next_tool_call(question, trace)
-    
-    if not next_tool_call:
-        # No more tools to call - check if we have successful results in messages
-        has_tool_result = any(
-            'tool_result' in msg 
-            for msg in messages
-        )
-        
-        if has_tool_result:
-            # Get the last tool result from messages and generate answer
-            for msg in reversed(messages):
-                if 'tool_result' in msg:
-                    tool_result = msg['tool_result']
-                    tool_name = msg.get('tool_name', '')
-                    answer = _format_tool_answer(tool_result, tool_name)
-                    if answer:
-                        return {
-                            **state,
-                            'loop_count': state.get('loop_count', 0),  # Don't increment
-                            'answer': answer,
-                        }
-        
-        # No successful tools or no answer - increment loop_count and continue
-        # This will eventually hit MAX_STEPS and route to degrade
-        return {
-            **state,
-            'loop_count': new_loop_count,
-        }
-    
-    # Call the tool
-    tool_name = next_tool_call['tool']
-    tool_args = next_tool_call['args']
-    
-    if tool_name not in tools:
-        return {
-            **state,
-            'loop_count': new_loop_count,
-            'error': f'Tool {tool_name} not available',
-        }
-    
-    # Dispatch tool call
-    tool_func = tools[tool_name]
-    updated_state, tool_result = tools_dispatcher(
-        state, tool_name, tool_func, new_loop_count, tool_args
-    )
-    
-    # Update loop count in the returned state
-    updated_state['loop_count'] = new_loop_count
-    
-    # Store tool result in messages for context and potential reuse
-    # Note: Use 'assistant' role for Mistral API compatibility (no 'tool' role support)
-    tool_message = {
-        'role': 'assistant',
-        'content': f"Tool {tool_name} returned: {json.dumps(tool_result)}",
-        'tool_name': tool_name,
-        'tool_result': tool_result,
-    }
-    updated_state['messages'] = messages + [tool_message]
-    
-    # Don't set answer here - let the deterministic logic decide when we have enough
-    # The graph will continue looping until agent decides to set an answer
-    return updated_state
-
-
-def _get_next_tool_call(question: str, trace: list[ToolCallRecord]) -> Optional[dict]:
-    """
-    Determine the next tool to call based on question and trace.
-    
-    Returns: {'tool': tool_name, 'args': dict} or None
-    """
-    question_lower = question.lower()
-    called_tools = {r['tool_name'] for r in trace}
-    
-    # If we've already called impact_analysis and got results, we're done
-    if 'impact_analysis' in called_tools:
-        return None
-    
-    # If we've already called lookup_entity and found a supplier, call impact_analysis
-    if 'lookup_entity' in called_tools:
-        # Get the entity from the trace
-        for record in trace:
-            if record['tool_name'] == 'lookup_entity' and record['status'] == STATUS_OK:
-                # Extract entity info from the tool args
-                args = record.get('args', {})
-                name = args.get('name', '')
-                if 'exotic' in name.lower() or 'liquids' in name.lower():
-                    return {
-                        'tool': 'impact_analysis',
-                        'args': {'entity_key': '1', 'entity_label': 'Supplier', 'direction': 'out', 'depth': 3}
-                    }
-    
-    # If impact_analysis was called but failed or returned empty
-    impact_records = [r for r in trace if r['tool_name'] == 'impact_analysis']
-    if impact_records:
-        return None  # Done after impact_analysis
-    
-    # Question analysis for first tool call
-    if 'impact' in question_lower or 'risk' in question_lower or 'failure' in question_lower:
-        if 'exotic' in question_lower or 'liquids' in question_lower:
-            return {
-                'tool': 'lookup_entity',
-                'args': {'name': 'Exotic Liquids', 'label': 'Supplier'}
-            }
-        elif 'supplier' in question_lower:
-            return {
-                'tool': 'lookup_entity',
-                'args': {'name': question, 'label': 'Supplier'}
-            }
-    
-    elif 'co-purchase' in question_lower or 'also bought' in question_lower or 'co purchased' in question_lower:
-        return {
-            'tool': 'co_purchase',
-            'args': {'product_key': '1'}  # Default to Chai (productID 1)
-        }
-    
-    elif 'customer' in question_lower and ('history' in question_lower or 'order' in question_lower):
-        # Extract customer key if present (e.g., "ALFKI")
-        customer_key = None
-        for word in question.split():
-            if word.upper() in ['ALFKI', 'BOLID', 'BONAP', 'CHOPS', 'ERNSH', 'FOLKO', 'FRANK', 'GREAL', 'GROSR', 'HUNGC']:
-                customer_key = word.upper()
-                break
-        return {
-            'tool': 'customer_history',
-            'args': {'customer_key': customer_key or 'ALFKI'}
-        }
-    
-    elif 'revenue' in question_lower or 'aggregate' in question_lower:
-        return {
-            'tool': 'aggregate',
-            'args': {'label': 'Supplier', 'group_by': 'country', 'metric': 'sum_revenue'}
-        }
-    
-    # For other questions, try lookup_entity with different args each time
-    # to ensure we keep making tool calls until MAX_STEPS is reached
-    # This is important for the degrade test case
-    lookup_count = sum(1 for r in trace if r['tool_name'] == 'lookup_entity')
-    if 'lookup_entity' in called_tools:
-        # Try with a different argument
-        return {
-            'tool': 'lookup_entity',
-            'args': {'name': f'entity_{lookup_count + 1}', 'label': None}
-        }
-    else:
-        # First time, try with first word
-        first_word = question.split()[0] if question else ''
-        return {
-            'tool': 'lookup_entity',
-            'args': {'name': first_word, 'label': None}
-        }
-    
-    # No more tool calls to make
-    return None
+    return TOOL_MODES.get(tool_name, MODE_CURATED)
 
 
 def _parse_llm_tool_call(response: str) -> Optional[dict]:
-    """
-    Parse LLM response for tool call in format: TOOL: tool_name(json_args)
-    
-    Returns: {'tool': tool_name, 'args': dict} or None
-    
-    Handles JSON args that may contain nested parentheses (e.g., Cypher queries).
-    Strategy: Use a robust method to find tool calls regardless of markdown formatting.
-    """
-    # List of known tool names
-    known_tools = ['lookup_entity', 'impact_analysis', 'co_purchase', 'customer_history', 'aggregate', 'run_readonly_cypher']
-    
-    # Try to find each known tool followed by (
-    for tool in known_tools:
-        # Pattern: tool_name(
-        pattern = rf'\b{re.escape(tool)}\s*\('
-        match = re.search(pattern, response)
-        if match:
-            tool_name = tool
-            start_idx = match.end()
-            
-            # Find the matching { and }
-            json_start = response.find('{', start_idx)
-            if json_start == -1:
-                continue
-            
-            # Find the matching closing } - handle nested braces
-            depth = 0
-            json_end = -1
-            for i in range(json_start, len(response)):
-                if response[i] == '{':
-                    depth += 1
-                elif response[i] == '}':
-                    depth -= 1
-                    if depth == 0:
-                        json_end = i + 1
-                        break
-            
-            if json_end == -1:
-                continue
-            
-            args_str = response[json_start:json_end]
-            
-            try:
-                args = json.loads(args_str)
-                if not isinstance(args, dict):
-                    continue
-                return {'tool': tool_name, 'args': args}
-            except json.JSONDecodeError:
-                continue
-    
-    return None
-    
+    """Parse the explicit TOOL directive, including markdown and nested JSON."""
+    marker = re.search(r"\*{0,2}TOOL\*{0,2}\s*:\s*`?\s*([a-z_]+)\s*\(", response, re.I)
+    if not marker:
+        return None
+    name = marker.group(1)
+    if name not in {
+        "lookup_entity", "impact_analysis", "co_purchase", "customer_history",
+        "aggregate", "run_readonly_cypher",
+    }:
+        return None
+    remainder = response[marker.end():].lstrip()
     try:
-        # Try to parse as JSON
-        args = json.loads(args_str)
-        if not isinstance(args, dict):
-            return None
-        return {'tool': tool_name, 'args': args}
+        args, offset = json.JSONDecoder().raw_decode(remainder)
     except json.JSONDecodeError:
-        # Try to parse as key=value pairs
-        args = {}
-        pairs = re.findall(r'(\w+)\s*=\s*"([^"]*)"', args_str)
-        for key, value in pairs:
-            args[key] = value
-        
-        # Also try without quotes
-        pairs2 = re.findall(r'(\w+)\s*=\s*([^,\s\)]+)', args_str)
-        for key, value in pairs2:
-            if key not in args:
-                # Try to parse as number
-                try:
-                    args[key] = int(value)
-                except ValueError:
-                    try:
-                        args[key] = float(value)
-                    except ValueError:
-                        args[key] = value
-        
-        return {'tool': tool_name, 'args': args}
-
-
-def _format_tool_answer(tool_result: dict, tool_name: str) -> str:
-    """Format answer string from a single tool result."""
-    if not tool_result or tool_result.get('status') != STATUS_OK:
         return None
-    
-    if tool_name == 'impact_analysis':
-        return _format_impact_answer(tool_result)
-    elif tool_name == 'co_purchase':
-        return _format_co_purchase_answer(tool_result)
-    elif tool_name == 'customer_history':
-        return _format_customer_history_answer(tool_result)
-    elif tool_name == 'aggregate':
-        return _format_aggregate_answer(tool_result)
-    elif tool_name == 'lookup_entity':
-        return _format_lookup_answer(tool_result)
-    else:
+    if not isinstance(args, dict) or not remainder[offset:].lstrip().startswith(")"):
         return None
+    return {"tool": name, "args": args}
 
 
-def _format_impact_answer(tool_result: dict) -> str:
-    """Format answer for impact_analysis tool."""
-    anchor = tool_result.get('anchor', {})
-    aggregates = tool_result.get('aggregates', {})
-    subgraph = tool_result.get('subgraph', {})
-    
-    anchor_name = anchor.get('name', 'Unknown')
-    anchor_label = anchor.get('label', 'Unknown')
-    
-    products_affected = aggregates.get('products_affected', 0)
-    orders_affected = aggregates.get('orders_affected', 0)
-    revenue_at_risk = aggregates.get('revenue_at_risk', 0)
-    unusable_lines = aggregates.get('unusable_lines', 0)
-    
-    return (
-        f"If {anchor_label} '{anchor_name}' fails, the impact analysis shows:\n"
-        f"- Products affected: {products_affected}\n"
-        f"- Orders affected: {orders_affected}\n"
-        f"- Revenue at risk: ${revenue_at_risk:,.2f}\n"
-        f"- Unusable lines: {unusable_lines}"
+def agent_step(state: AgentState, available_tools: dict[str, ToolFunc]) -> dict:
+    """Make one ReAct decision. Tool execution belongs exclusively to tools."""
+    count = state.get("loop_count", 0)
+    if count >= MAX_STEPS:
+        return {"loop_count": count}
+    messages = state.get("messages", [])
+    if messages and isinstance(messages[-1], ToolMessage):
+        latest = messages[-1]
+        try:
+            payload = json.loads(latest.content)
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("status") in ("ok", "retry_ok", "empty"):
+            final_tools = {"impact_analysis", "co_purchase", "customer_history", "aggregate"}
+            if latest.name in final_tools or (
+                latest.name == "run_readonly_cypher" and
+                (payload.get("status") == "empty" or any(_row_citation(row) for row in payload.get("rows", [])))
+            ):
+                return {"loop_count": count, "messages": [AIMessage(content="FINAL: Sufficient graph evidence collected.")]}
+    from .llm import generate_agent_response
+
+    response = generate_agent_response(
+        question=state.get("question", ""),
+        messages=state.get("messages", []),
+        available_tools=list(available_tools),
     )
+    call = _parse_llm_tool_call(response)
+    if call is not None:
+        message = AIMessage(
+            content=response,
+            tool_calls=[{"name": call["tool"], "args": call["args"], "id": str(uuid4())}],
+        )
+    else:
+        message = AIMessage(content=response)
+    return {"loop_count": count + 1, "messages": [message]}
 
 
-def _format_co_purchase_answer(tool_result: dict) -> str:
-    """Format answer for co_purchase tool."""
-    product = tool_result.get('product', {})
-    product_name = product.get('name', 'Unknown')
-    recommendations = tool_result.get('recommendations', [])
-    
-    if not recommendations:
-        return f"No co-purchase recommendations found for {product_name}."
-    
-    rec_list = [f"- {r.get('name', 'Unknown')} (co-bought {r.get('co_bought', 0)} times)" 
-                for r in recommendations]
-    return f"Products frequently co-purchased with {product_name}:\n" + "\n".join(rec_list)
+def execute_tool_step(state: AgentState, available_tools: dict[str, ToolFunc]) -> dict:
+    """Execute exactly one requested tool and record exactly one trace entry."""
+    last = state["messages"][-1]
+    if not isinstance(last, AIMessage) or len(last.tool_calls) != 1:
+        raise ValueError("tools node requires exactly one pending tool call")
+    call = last.tool_calls[0]
+    name, args = call["name"], call["args"]
+    mode = _get_tool_mode(name)
+    started = time.monotonic()
+    try:
+        if name not in available_tools:
+            result = {"status": STATUS_INVALID, "error": f"Unknown tool: {name}"}
+        else:
+            result = available_tools[name](**args)
+    except Exception as exc:
+        result = {"status": STATUS_INVALID, "error": str(exc)}
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    if not isinstance(result, dict):
+        result = {"status": STATUS_INVALID, "error": "Tool returned a non-dict result"}
+    rows_field = {
+        "lookup_entity": "matches", "co_purchase": "recommendations",
+        "customer_history": "orders", "aggregate": "groups",
+        "run_readonly_cypher": "rows",
+    }.get(name)
+    if name == "impact_analysis":
+        result_rows = len(result.get("subgraph", {}).get("nodes", []))
+    else:
+        result_rows = len(result.get(rows_field, [])) if rows_field else 0
+    attempts = result.get("attempts", []) if name == "run_readonly_cypher" else []
+    record: ToolCallRecord = {
+        "step": state.get("loop_count", 0), "tool_name": name, "args": args,
+        "mode": mode, "status": result.get("status", STATUS_INVALID),
+        "result_rows": result_rows,
+        "cypher": result.get("query", args.get("query")) if name == "run_readonly_cypher" else None,
+        "latency_ms": elapsed_ms, "retry_count": min(1, max(0, len(attempts) - 1)),
+    }
+    tool_message = ToolMessage(
+        content=json.dumps(result, default=str), name=name, tool_call_id=call["id"]
+    )
+    return {"trace": state.get("trace", []) + [record], "messages": [tool_message]}
 
 
-def _format_customer_history_answer(tool_result: dict) -> str:
-    """Format answer for customer_history tool."""
-    customer = tool_result.get('customer', {})
-    orders = tool_result.get('orders', [])
-    
-    customer_name = customer.get('name', 'Unknown')
-    customer_key = customer.get('key', 'Unknown')
-    customer_country = customer.get('country', 'Unknown')
-    
-    if not orders:
-        return f"No order history found for {customer_name}."
-    
-    order_list = []
-    for o in orders:
-        order_key = o.get('order_key', '?')
-        order_date = o.get('order_date', '?')
-        total = o.get('total', 0)
-        ship_country = o.get('ship_country', '?')
-        order_list.append(f"- Order {order_key} on {order_date}: ${total:.2f} ({ship_country})")
-    
-    return f"{customer_name} ({customer_key}) from {customer_country} has {len(orders)} orders:\n" + "\n".join(order_list)
 
 
-def _format_aggregate_answer(tool_result: dict) -> str:
-    """Format answer for aggregate tool."""
-    groups = tool_result.get('groups', [])
-    
-    if not groups:
-        return "No aggregate results found."
-    
-    # Sort by metric_value descending (assuming it's revenue or similar)
-    sorted_groups = sorted(groups, key=lambda x: x.get('metric_value', 0), reverse=True)
-    
-    group_list = [f"- {g.get('group_value', '?')}: {g.get('metric_value', 0):.2f}" 
-                  for g in sorted_groups]
-    
-    return "Aggregate results:\n" + "\n".join(group_list)
+def _result_messages(state: AgentState) -> list[tuple[str, dict]]:
+    results = []
+    for message in state.get("messages", []):
+        if isinstance(message, ToolMessage):
+            try:
+                result = json.loads(message.content)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if isinstance(result, dict):
+                results.append((message.name or "", result))
+    return results
 
 
-def _format_lookup_answer(tool_result: dict) -> str:
-    """Format answer for lookup_entity tool."""
-    matches = tool_result.get('matches', [])
-    query_name = tool_result.get('query_name', 'Unknown')
-    
-    if not matches:
-        return f"No matches found for '{query_name}'."
-    
-    match_list = [f"- {m.get('label', '?')} '{m.get('name', '?')}' (key: {m.get('key', '?')})"
-                 for m in matches]
-    
-    return f"Found {len(matches)} match(es) for '{query_name}':\n" + "\n".join(match_list)
+def _citation(node: dict) -> dict | None:
+    if not isinstance(node, dict):
+        return None
+    label, key, name = node.get("label"), node.get("key"), node.get("name")
+    if label not in {"Product", "Order", "Customer", "Supplier", "Employee", "Category", "Shipper", "Territory", "Region"} or key is None or name is None:
+        return None
+    return {"label": label, "key": str(key), "name": str(name)}
 
 
-def _format_trace_for_llm(trace: list[ToolCallRecord]) -> str:
-    """Format trace for LLM context."""
-    if not trace:
-        return ""
-    
-    lines = ["Previous tool calls:"]
-    for record in trace:
-        lines.append(f"  Step {record['step']}: {record['tool_name']}({record['args']}) -> {record['status']} ({record['result_rows']} rows)")
-    return "\n".join(lines)
+def _marker(citation: dict) -> str:
+    return f"[{citation['label']}:{citation['key']}]"
 
 
-# =============================================================================
-# NODE 2.6: synthesize
-# =============================================================================
+def _row_citation(row: dict) -> dict | None:
+    for label, key_prop, name_prop in (
+        ("Product", "productID", "productName"), ("Supplier", "supplierID", "companyName"),
+        ("Customer", "customerID", "companyName"), ("Order", "orderID", "orderID"),
+        ("Category", "categoryID", "categoryName"),
+    ):
+        key = row.get(key_prop)
+        if key is not None:
+            return {"label": label, "key": str(key), "name": str(row.get(name_prop, key))}
+    for value in row.values():
+        citation = _citation(value)
+        if citation:
+            return citation
+    return None
+
 
 def synthesize(state: AgentState) -> AgentState:
-    """
-    Synthesize final answer from tool results.
-    
-    Contract: PROJECT.md §2, PLAN.md 2.6
-    
-    Produces:
-    - state['citations']: List of Citation objects
-    - state['confidence']: Float computed via rubric
-    - state['confidence_rationale']: String explaining the confidence
-    
-    Inline citations are included in the answer.
-    
-    Note: For agent route, the answer is already set by the agent node when it
-    has sufficient information. Synthesize only adds citations, confidence, and rationale.
-    
-    Invariant: 
-    - Citations are synthesized from what the final answer actually claims,
-      not the union of tool results.
-    - For chitchat/refusal: classify sets answer and confidence; synthesize is bypassed
-    - For degrade: synthesize is NOT called (per invariant: budget exhaustion 
-      routes to degrade, never to synthesize)
-    """
-    route = state.get('route', '')
-    trace = state.get('trace', [])
-    answer = state.get('answer', '')
-    
-    # For chitchat and refusal, answer is already set by classify
-    # synthesize is NOT the owner of answer for these routes
-    if route in (ROUTE_CHITCHAT, ROUTE_REFUSAL):
-        # Confidence and rationale already set by classify
+    """Build an answer from actual tool payloads and cite only returned nodes."""
+    if state.get("route") != ROUTE_AGENT:
         return state
-    
-    # For agent route, answer should already be set by agent node
-    # synthesize adds citations, confidence, and rationale
-    if route == ROUTE_AGENT:
-        if not answer:
-            # No answer set - this shouldn't happen, but generate a fallback
-            answer = "I couldn't find an answer to your question."
-        
-        citations = _extract_citations_from_trace(trace)
-        confidence, rationale = compute_confidence(trace, route)
-        
-        return {
-            **state,
-            'answer': answer,
-            'citations': citations,
-            'confidence': confidence,
-            'confidence_rationale': rationale,
-        }
-    
-    # degrade route: synthesize should never be called for degrade
-    # (per invariant: budget exhaustion routes to degrade, never to synthesize)
-    # But if we somehow get here, return state unchanged
-    return state
+    results = _result_messages(state)
+    citations: dict[tuple[str, str], dict] = {}
+    def cite(node):
+        citation = _citation(node)
+        if citation:
+            citations[(citation["label"], citation["key"])] = citation
+            return _marker(citation)
+        return ""
+
+    answer = "I found no cited graph evidence for this question."
+    for tool_name, result in reversed(results):
+        status = result.get("status")
+        if status in ("invalid", "retry_failed"):
+            continue
+        if status == "empty":
+            answer = "The graph query returned no matching rows."
+            break
+        if tool_name == "impact_analysis":
+            anchor = result.get("anchor")
+            if not _citation(anchor):
+                continue
+            marker = cite(anchor)
+            aggregates = result.get("aggregates", {})
+            answer = (
+                f"{anchor['name']} {marker} affects {aggregates.get('products_affected', 0)} products "
+                f"and {aggregates.get('orders_affected', 0)} orders; estimated revenue at risk is "
+                f"${aggregates.get('revenue_at_risk', 0):,.2f}. "
+                f"{aggregates.get('unusable_lines', 0)} order lines could not be valued {marker}."
+            )
+            break
+        if tool_name == "co_purchase":
+            anchor = result.get("product")
+            if not _citation(anchor):
+                continue
+            anchor_marker = cite(anchor)
+            lines = [f"Products co-purchased with {anchor['name']} {anchor_marker}:"]
+            for item in result.get("recommendations", []):
+                marker = cite(item)
+                if marker:
+                    lines.append(f"- {item['name']} {marker}: {item['co_bought']} shared orders")
+            answer = "\n".join(lines)
+            break
+        if tool_name == "customer_history":
+            customer = result.get("customer")
+            if not _citation(customer):
+                continue
+            marker = cite(customer)
+            orders = result.get("orders", [])
+            lines = [f"{customer['name']} {marker} has {len(orders)} returned orders:"]
+            dated_orders = []
+            for order in orders:
+                order_node = {"label": "Order", "key": order.get("order_key"), "name": str(order.get("order_key"))}
+                order_marker = cite(order_node)
+                lines.append(f"- {order.get('order_date')}: order {order.get('order_key')} {order_marker}, total ${order.get('total', 0):,.2f}")
+                try:
+                    from datetime import date
+                    dated_orders.append((date.fromisoformat(str(order.get("order_date", "")).split()[0]), order_marker))
+                except ValueError:
+                    pass
+            gaps = [((later[0] - earlier[0]).days, earlier[1], later[1]) for earlier, later in zip(dated_orders, dated_orders[1:])]
+            if gaps:
+                days, before, after = max(gaps)
+                lines.append(f"Largest gap between returned orders: {days} days, between {before} and {after}.")
+            answer = "\n".join(lines)
+            break
+        if tool_name == "lookup_entity":
+            lines = []
+            for match in result.get("matches", []):
+                marker = cite(match)
+                if marker:
+                    lines.append(f"- {match['name']} {marker}")
+            if lines:
+                answer = "Matching graph nodes:\n" + "\n".join(lines)
+                break
+        if tool_name == "run_readonly_cypher":
+            lines = []
+            for row in result.get("rows", [])[:20]:
+                citation = _row_citation(row)
+                if citation:
+                    marker = cite(citation)
+                    details = ", ".join(f"{k}: {v}" for k, v in row.items() if not isinstance(v, (dict, list)))
+                    lines.append(f"- {details} {marker}")
+            if lines:
+                answer = "Query results:\n" + "\n".join(lines)
+                break
+        if tool_name == "aggregate":
+            lines = []
+            for group in result.get("groups", []):
+                markers = [cite(node) for node in group.get("evidence", [])]
+                markers = [marker for marker in markers if marker]
+                if markers:
+                    lines.append(f"- {group['group_value']}: {group['metric_value']} {' '.join(markers)}")
+            answer = "Grouped results:\n" + "\n".join(lines) if lines else "The aggregate result contained no citable nodes."
+            break
+    if citations and results:
+        try:
+            from .llm import synthesize_from_evidence
+            revised = synthesize_from_evidence(answer)
+            expected_markers = set(re.findall(r"\[[A-Za-z]+:[^\]]+\]", answer))
+            revised_markers = set(re.findall(r"\[[A-Za-z]+:[^\]]+\]", revised))
+            source_numbers = set(re.findall(r"\d[\d,.]*", answer))
+            revised_numbers = set(re.findall(r"\d[\d,.]*", revised))
+            lines_cited = all("[" in line and "]" in line for line in revised.splitlines() if line.strip())
+            if revised_markers == expected_markers and revised_numbers <= source_numbers and lines_cited:
+                answer = revised
+        except Exception:
+            # Keep the deterministic, evidence-grounded draft if wording fails.
+            pass
+    confidence, rationale = compute_confidence(state.get("trace", []), ROUTE_AGENT)
+    return {"answer": answer, "citations": list(citations.values()), "confidence": confidence, "confidence_rationale": rationale}
 
 
 
-
-def _format_impact_answer(tool_result: dict) -> str:
-    """Format answer for impact_analysis tool using actual result."""
-    anchor = tool_result.get('anchor', {})
-    aggregates = tool_result.get('aggregates', {})
-    subgraph = tool_result.get('subgraph', {})
-    
-    anchor_name = anchor.get('name', 'Unknown')
-    anchor_label = anchor.get('label', 'Unknown')
-    
-    products_affected = aggregates.get('products_affected', 0)
-    orders_affected = aggregates.get('orders_affected', 0)
-    revenue_at_risk = aggregates.get('revenue_at_risk', 0)
-    unusable_lines = aggregates.get('unusable_lines', 0)
-    
-    return (
-        f"If {anchor_label} '{anchor_name}' fails, the impact analysis shows:\n"
-        f"- Products affected: {products_affected}\n"
-        f"- Orders affected: {orders_affected}\n"
-        f"- Revenue at risk: ${revenue_at_risk:,.2f}\n"
-        f"- Unusable lines: {unusable_lines}\n"
-        f"\nSubgraph: {subgraph.get('nodes', {})} nodes, {subgraph.get('edges', {})} edges"
-    )
-
-
-def _format_co_purchase_answer(tool_result: dict) -> str:
-    """Format answer for co_purchase tool using actual result."""
-    product = tool_result.get('product', {})
-    product_name = product.get('name', 'Unknown')
-    recommendations = tool_result.get('recommendations', [])
-    
-    if not recommendations:
-        return f"No co-purchase recommendations found for {product_name}."
-    
-    rec_list = [f"- {r.get('name', 'Unknown')} (co-bought {r.get('co_bought', 0)} times)" 
-                for r in recommendations]
-    return f"Products frequently co-purchased with {product_name}:\n" + "\n".join(rec_list)
-
-
-def _format_customer_history_answer(tool_result: dict) -> str:
-    """Format answer for customer_history tool using actual result."""
-    customer = tool_result.get('customer', {})
-    orders = tool_result.get('orders', [])
-    
-    customer_name = customer.get('name', 'Unknown')
-    customer_key = customer.get('key', 'Unknown')
-    customer_country = customer.get('country', 'Unknown')
-    
-    if not orders:
-        return f"No order history found for {customer_name}."
-    
-    order_list = []
-    for o in orders:
-        order_key = o.get('order_key', '?')
-        order_date = o.get('order_date', '?')
-        total = o.get('total', 0)
-        ship_country = o.get('ship_country', '?')
-        order_list.append(f"- Order {order_key} on {order_date}: ${total:.2f} ({ship_country})")
-    
-    return f"{customer_name} ({customer_key}) from {customer_country} has {len(orders)} orders:\n" + "\n".join(order_list)
-
-
-def _format_aggregate_answer(tool_result: dict) -> str:
-    """Format answer for aggregate tool using actual result."""
-    groups = tool_result.get('groups', [])
-    
-    if not groups:
-        return f"No aggregate results found."
-    
-    # Sort by metric_value descending (assuming it's revenue or similar)
-    sorted_groups = sorted(groups, key=lambda x: x.get('metric_value', 0), reverse=True)
-    
-    group_list = [f"- {g.get('group_value', '?')}: {g.get('metric_value', 0):.2f}" 
-                  for g in sorted_groups]
-    
-    return f"Aggregate results:\n" + "\n".join(group_list)
-
-
-def _format_lookup_answer(tool_result: dict) -> str:
-    """Format answer for lookup_entity tool using actual result."""
-    matches = tool_result.get('matches', [])
-    query_name = tool_result.get('query_name', 'Unknown')
-    
-    if not matches:
-        return f"No matches found for '{query_name}'."
-    
-    match_list = [f"- {m.get('label', '?')} '{m.get('name', '?')}' (key: {m.get('key', '?')})"
-                 for m in matches]
-    
-    return f"Found {len(matches)} match(es) for '{query_name}':\n" + "\n".join(match_list)
-
-
-def _extract_citations_from_trace(trace: list[ToolCallRecord]) -> list[dict]:
-    """
-    Extract citations from the trace.
-    
-    Citations are synthesized from what the final answer actually claims.
-    No claim without a citation; no citation without a node.
-    """
-    citations = []
-    
-    # For now, extract entities from lookup_entity and impact_analysis calls
-    for record in trace:
-        tool_name = record.get('tool_name', '')
-        
-        if tool_name == 'lookup_entity' and record.get('status') == STATUS_OK:
-            # Extract entity info from args
-            args = record.get('args', {})
-            name = args.get('name', '')
-            label = args.get('label', '')
-            if name and label:
-                citations.append({
-                    'label': label,
-                    'key': '1',  # Simplified for now
-                    'name': name,
-                })
-        
-        elif tool_name == 'impact_analysis' and record.get('status') == STATUS_OK:
-            args = record.get('args', {})
-            entity_label = args.get('entity_label', '')
-            if entity_label:
-                citations.append({
-                    'label': entity_label,
-                    'key': args.get('entity_key', '1'),
-                    'name': 'Exotic Liquids',  # Simplified
-                })
-    
-    return citations
-
-
-# =============================================================================
-# NODE 2.7: degrade
-# =============================================================================
 
 def degrade(state: AgentState) -> AgentState:
     """
@@ -1077,14 +519,6 @@ def degrade(state: AgentState) -> AgentState:
     }
 
 
-# =============================================================================
-# EXPORT
-# =============================================================================
 
-__all__ = [
-    'classify',
-    'agent',
-    'tools_dispatcher',
-    'synthesize',
-    'degrade',
-]
+
+__all__ = ["classify", "agent_step", "execute_tool_step", "synthesize", "degrade"]
