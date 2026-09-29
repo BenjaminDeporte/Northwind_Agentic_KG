@@ -180,3 +180,64 @@ def test_unlabeled_lookup_includes_order_ids():
     with patch("src.neo4j.tools.client.run_read_query", side_effect=query):
         result = lookup_entity("10248")
     assert any(item["label"] == "Order" and item["key"] == "10248" for item in result["matches"])
+
+
+def test_labeled_customer_key_returns_canonical_lookup_payload(monkeypatch):
+    calls = []
+    customer = {
+        "customerID": "ALFKI", "companyName": "Alfreds Futterkiste",
+        "country": "Germany", "city": "Berlin",
+    }
+
+    def query(cypher, parameters=None):
+        calls.append(cypher)
+        if "toString(n.customerID) = $name" in cypher:
+            return ([{"n": customer}], None)
+        return ([], None)
+
+    monkeypatch.setattr("src.neo4j.tools.client.run_read_query", query)
+    result = lookup_entity(name="ALFKI", label="Customer")
+
+    assert result == {
+        "status": "ok", "query_name": "ALFKI", "matches": [{
+            "label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste",
+            "match": "exact", "properties": {"country": "Germany", "city": "Berlin"},
+        }],
+    }
+    assert any("toString(n.customerID) = $name" in cypher for cypher in calls)
+
+
+def test_labeled_customer_display_name_still_matches_exactly(monkeypatch):
+    customer = {"customerID": "ALFKI", "companyName": "Alfreds Futterkiste", "country": "Germany"}
+
+    def query(cypher, parameters=None):
+        if "n.companyName = $name" in cypher:
+            return ([{"n": customer}], None)
+        raise AssertionError("Exact display name should return before key lookup")
+
+    monkeypatch.setattr("src.neo4j.tools.client.run_read_query", query)
+    result = lookup_entity(name="Alfreds Futterkiste", label="Customer")
+    assert result["status"] == "ok"
+    assert result["matches"][0]["key"] == "ALFKI"
+    assert result["matches"][0]["match"] == "exact"
+
+
+def test_key_lookup_miss_preserves_contains_fuzzy_and_empty_tiers(monkeypatch):
+    def query(cypher, parameters=None):
+        if "toLower(" in cypher and "CONTAINS" in cypher:
+            if parameters["name"] == "Alfreds":
+                return ([{"n": {"customerID": "ALFKI", "companyName": "Alfreds Futterkiste"}}], None)
+            return ([], None)
+        if "WHERE" not in cypher:
+            return ([{"n": {"customerID": "ALFKI", "companyName": "Alfreds Futterkiste"}}], None)
+        return ([], None)
+
+    monkeypatch.setattr("src.neo4j.tools.client.run_read_query", query)
+    contains = lookup_entity(name="Alfreds", label="Customer")
+    assert contains["matches"][0]["match"] == "contains"
+
+    fuzzy = lookup_entity(name="Alfreds Futterkist", label="Customer")
+    assert fuzzy["matches"][0]["match"] == "fuzzy"
+
+    missing = lookup_entity(name="MISSING", label="Customer")
+    assert missing == {"status": "empty", "query_name": "MISSING", "matches": []}

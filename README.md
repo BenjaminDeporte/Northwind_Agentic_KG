@@ -14,8 +14,8 @@ User Query -> LangGraph Agent -> lookup_entity (Neo4j Cypher) -> Synthesize Resp
 
 ### Prerequisites
 - Python 3.10+
+- [uv](https://docs.astral.sh/uv/)
 - Neo4j Aura instance with Northwind dataset loaded
-- Streamlit
 
 ### Installation
 
@@ -24,18 +24,14 @@ User Query -> LangGraph Agent -> lookup_entity (Neo4j Cypher) -> Synthesize Resp
 git clone <repository-url>
 cd Northwind_Agentic_KG
 
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-
-# Install dependencies
-pip install -r requirements.txt
+# Create the project environment and install locked dependencies
+uv sync
 ```
 
 ### Configuration
 
 1. Copy `.env.example` to `.env`
-2. Set your Neo4j Aura credentials:
+2. Set your Neo4j Aura credentials (`NEO4J_URI`, `NEO4J_PASSWORD`, and `NEO4J_USERNAME` or `NEO4J_USER`) and `MISTRAL_API_KEY`:
    ```
    NEO4J_URI=<your-aura-instance-uri>
    NEO4J_USER=<your-username>
@@ -45,14 +41,14 @@ pip install -r requirements.txt
 ### Running the Application
 
 ```bash
-# Start Streamlit UI
-streamlit run src/streamlit/app.py
+# Start Streamlit UI from the repository root
+uv run streamlit run src/streamlit/app.py
 
-# Or test the agent in CLI mode
-python -m src.agents.graph
+# Or run the agent in CLI mode
+uv run python -m src.agents.graph
 ```
 
-The Streamlit app will open in your browser at `http://localhost:8501`.
+The initial Streamlit page provides placeholders for chat, trace, and graph evidence. Agent and database wiring is added in the following Phase 3 items. Streamlit listens on port `8501` by default; when connected to the project over SSH, forward that port in VS Code to open the page in your local browser.
 
 ## Project Structure
 

@@ -1,11 +1,12 @@
 """Behavioral tests for the contracted graph and read-only boundary."""
 from unittest.mock import patch
+import json
 
 from langchain_core.messages import AIMessage, ToolMessage
 from src.agents.graph import compile_graph
 from src.agents.nodes import execute_tool_step, _parse_llm_tool_call
 from src.neo4j.client import Neo4jClient
-from src.neo4j.tools import aggregate
+from src.neo4j.tools import aggregate, run_readonly_cypher
 
 
 def _initial(question):
@@ -120,3 +121,71 @@ def test_aggregate_claims_cite_contributing_nodes():
         state = compile_graph({"aggregate": lambda **kwargs: payload}).invoke(_initial("Revenue by supplier country"))
     assert state["citations"] == [{"label": "Supplier", "key": "1", "name": "Exotic Liquids"}]
     assert "35916.8 [Supplier:1]" in state["answer"]
+
+
+def test_show_customer_by_key_has_details_citation_and_consistent_trace():
+    from src.neo4j.tools import lookup_entity
+
+    customer = {
+        "customerID": "ALFKI", "companyName": "Alfreds Futterkiste",
+        "city": "Berlin", "country": "Germany",
+    }
+
+    def mocked_read(cypher, parameters=None):
+        if "toString(n.customerID) = $name" in cypher:
+            return ([{"n": customer}], None)
+        return ([], None)
+
+    decisions = iter([
+        'TOOL: lookup_entity({"name":"ALFKI","label":"Customer"})',
+        "FINAL: I have the customer details.",
+    ])
+    with patch("src.neo4j.tools.client.run_read_query", side_effect=mocked_read), patch(
+        "src.agents.graph.classify", lambda state: {**state, "route": "agent"}
+    ), patch("src.agents.llm.generate_agent_response", lambda **kwargs: next(decisions)), patch(
+        "src.agents.llm.synthesize_from_evidence", lambda draft: draft
+    ):
+        state = compile_graph({"lookup_entity": lookup_entity}).invoke(
+            _initial("Show info of customer ALFKI")
+        )
+
+    assert state["answer"].startswith("Matching graph nodes:")
+    assert "Alfreds Futterkiste [Customer:ALFKI]" in state["answer"]
+    assert "city: Berlin" in state["answer"] and "country: Germany" in state["answer"]
+    assert state["citations"] == [{
+        "label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste",
+    }]
+    assert [(item["tool_name"], item["status"], item["result_rows"]) for item in state["trace"]] == [
+        ("lookup_entity", "ok", 1),
+    ]
+
+
+def test_multiple_statement_query_is_invalid_and_recorded_without_execution():
+    query = "MATCH (c:Customer) RETURN c; MATCH (o:Order) RETURN o"
+    state = _initial("run this query")
+    state["loop_count"] = 1
+    state["messages"] = [AIMessage(content="", tool_calls=[{
+        "name": "run_readonly_cypher", "args": {"query": query}, "id": "multi",
+    }])]
+    with patch("src.neo4j.tools.client.explain") as explain, patch(
+        "src.neo4j.tools.client.run_read_query"
+    ) as execute:
+        update = execute_tool_step(state, {"run_readonly_cypher": run_readonly_cypher})
+    explain.assert_not_called()
+    execute.assert_not_called()
+    assert update["trace"][0]["status"] == "invalid"
+    assert update["trace"][0]["result_rows"] == 0
+    message = update["messages"][0]
+    assert json.loads(message.content)["status"] == "invalid"
+
+
+def test_trailing_semicolon_read_query_is_accepted_by_tool():
+    query = "MATCH (c:Customer) RETURN c;"
+    with patch("src.neo4j.tools.client.explain", return_value=True), patch(
+        "src.neo4j.tools.client.run_read_query", return_value=([], None)
+    ) as execute:
+        result = run_readonly_cypher(query)
+    assert result["status"] == "empty"
+    assert result["query"] == query
+    assert result["error"] is None
+    execute.assert_called_once_with(query)

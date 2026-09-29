@@ -262,13 +262,15 @@ def agent_step(state: AgentState, available_tools: dict[str, ToolFunc]) -> dict:
             payload = json.loads(latest.content)
         except (TypeError, json.JSONDecodeError):
             payload = {}
-        if payload.get("status") in ("ok", "retry_ok", "empty"):
-            final_tools = {"impact_analysis", "co_purchase", "customer_history", "aggregate"}
-            if latest.name in final_tools or (
-                latest.name == "run_readonly_cypher" and
-                (payload.get("status") == "empty" or any(_row_citation(row) for row in payload.get("rows", [])))
+        status = payload.get("status")
+        final_tools = {"impact_analysis", "co_purchase", "customer_history", "aggregate"}
+        if latest.name in final_tools and status in ("ok", "retry_ok", "empty"):
+            return {"loop_count": count, "messages": [AIMessage(content="FINAL: Sufficient graph evidence collected.")]}
+        if latest.name == "run_readonly_cypher":
+            if status in ("empty", "invalid", "retry_failed") or (
+                status in ("ok", "retry_ok") and _normalized_result_has_evidence(payload)
             ):
-                return {"loop_count": count, "messages": [AIMessage(content="FINAL: Sufficient graph evidence collected.")]}
+                return {"loop_count": count, "messages": [AIMessage(content="FINAL: Exploratory query result is ready for synthesis.")]}
     from .llm import generate_agent_response
 
     response = generate_agent_response(
@@ -357,28 +359,59 @@ def _marker(citation: dict) -> str:
     return f"[{citation['label']}:{citation['key']}]"
 
 
-def _row_citation(row: dict) -> dict | None:
-    for label, key_prop, name_prop in (
-        ("Product", "productID", "productName"), ("Supplier", "supplierID", "companyName"),
-        ("Customer", "customerID", "companyName"), ("Order", "orderID", "orderID"),
-        ("Category", "categoryID", "categoryName"),
-    ):
-        key = row.get(key_prop)
-        if key is not None:
-            return {"label": label, "key": str(key), "name": str(row.get(name_prop, key))}
-    for value in row.values():
+def _row_citations(row: dict) -> list[dict]:
+    """Collect canonical node citations nested anywhere in an exploratory row."""
+    citations: dict[tuple[str, str], dict] = {}
+
+    def visit(value):
         citation = _citation(value)
         if citation:
-            return citation
-    return None
+            citations[(citation["label"], citation["key"])] = citation
+        elif isinstance(value, dict):
+            for nested in value.values():
+                visit(nested)
+        elif isinstance(value, (list, tuple)):
+            for nested in value:
+                visit(nested)
+
+    visit(row)
+    return list(citations.values())
+
+
+def _plural_label(label: str) -> str:
+    return {
+        "Category": "categories", "Country": "countries", "Employee": "employees",
+        "Customer": "customers", "Company": "companies",
+    }.get(label, f"{label.lower()}s")
+
+
+def _normalized_result_has_evidence(result: dict) -> bool:
+    """Check whether any normalized row carries citable node evidence."""
+    for row in result.get("rows", []):
+        evidence = row.get("evidence", {}) if isinstance(row, dict) else {}
+        if _row_citations(evidence.get("nodes", [])):
+            return True
+    return False
+
+
+def _count_label(alias: str, evidence_nodes: list[dict]) -> str:
+    """Infer the counted label from a conventional <label>_count alias."""
+    names = {
+        "customer": "Customer", "order": "Order", "product": "Product",
+        "supplier": "Supplier", "employee": "Employee", "category": "Category",
+        "shipper": "Shipper", "territory": "Territory", "region": "Region",
+    }
+    prefix = alias.lower().removesuffix("_count").rstrip("s")
+    return names.get(prefix) or (evidence_nodes[0]["label"] if evidence_nodes else "Node")
 
 
 def synthesize(state: AgentState) -> AgentState:
-    """Build an answer from actual tool payloads and cite only returned nodes."""
+    """Build a final answer from tool results, distinguishing empty from failed queries."""
     if state.get("route") != ROUTE_AGENT:
         return state
     results = _result_messages(state)
     citations: dict[tuple[str, str], dict] = {}
+
     def cite(node):
         citation = _citation(node)
         if citation:
@@ -389,11 +422,98 @@ def synthesize(state: AgentState) -> AgentState:
     answer = "I found no cited graph evidence for this question."
     for tool_name, result in reversed(results):
         status = result.get("status")
-        if status in ("invalid", "retry_failed"):
-            continue
-        if status == "empty":
-            answer = "The graph query returned no matching rows."
+
+        if tool_name == "run_readonly_cypher":
+            if status in ("invalid", "retry_failed"):
+                error = result.get("error") or "The query failed validation or execution."
+                if status == "invalid":
+                    answer = f"The graph query was rejected before execution: {error}"
+                else:
+                    answer = f"The graph query could not be completed after its repair attempt: {error}"
+                break
+            if status == "empty":
+                answer = "The graph query ran successfully but returned no matching rows."
+                break
+            if status not in ("ok", "retry_ok"):
+                continue
+
+            lines = []
+            saw_uncitable_values = False
+            for row in result.get("rows", [])[:20]:
+                if not isinstance(row, dict):
+                    continue
+                values = row.get("values", {})
+                evidence = row.get("evidence", {})
+                if not isinstance(values, dict) or not isinstance(evidence, dict):
+                    continue
+                nodes = _row_citations(evidence.get("nodes", []))
+                if not nodes:
+                    saw_uncitable_values = saw_uncitable_values or bool(values)
+                    continue
+
+                count_values = [
+                    (key, value) for key, value in values.items()
+                    if "count" in key.lower() and isinstance(value, (int, float)) and not isinstance(value, bool)
+                ]
+                markers = " ".join(cite(node) for node in nodes)
+                if count_values:
+                    count_key, count_value = count_values[0]
+                    label = _count_label(count_key, nodes)
+                    anchor = next((node for node in nodes if node["label"] != label), None)
+                    if anchor and anchor["label"] == "Customer" and label == "Order":
+                        answer = (
+                            f"{anchor['name']} {_marker(anchor)} placed "
+                            f"{int(count_value):,} orders. {markers}"
+                        )
+                    elif anchor:
+                        answer = (
+                            f"{int(count_value):,} {_plural_label(label)} for "
+                            f"{anchor['name']} {_marker(anchor)}. {markers}"
+                        )
+                    else:
+                        answer = (
+                            f"The Northwind dataset contains {int(count_value):,} "
+                            f"{_plural_label(label)}. {markers}"
+                        )
+                    lines = []
+                    break
+
+                scalar_values = [
+                    (key, value) for key, value in values.items()
+                    if value is None or isinstance(value, (str, int, float, bool))
+                ]
+                if scalar_values:
+                    details = ", ".join(f"{key}: {value}" for key, value in scalar_values)
+                    lines.append(f"- {details} {markers}")
+                else:
+                    for node in nodes:
+                        lines.append(f"- {node['name']} {_marker(node)}")
+
+            if answer != "I found no cited graph evidence for this question.":
+                break
+            if lines:
+                answer = "Query results:\n" + "\n".join(lines)
+            elif saw_uncitable_values:
+                answer = "The graph query returned values, but no node evidence was included to cite them."
+            else:
+                answer = "The graph query completed but returned no citable graph evidence."
             break
+
+        if status in ("invalid", "retry_failed"):
+            error = result.get("error")
+            answer = f"The {tool_name} request could not be completed."
+            if error:
+                answer += f" {error}"
+            break
+        if status == "empty":
+            if tool_name == "lookup_entity":
+                answer = "I couldn't find a graph entity matching that name or key."
+            elif tool_name == "aggregate":
+                answer = "The aggregate query ran successfully but returned no matching groups."
+            else:
+                answer = f"The {tool_name} tool ran successfully but returned no matching records."
+            break
+
         if tool_name == "impact_analysis":
             anchor = result.get("anchor")
             if not _citation(anchor):
@@ -447,20 +567,15 @@ def synthesize(state: AgentState) -> AgentState:
             for match in result.get("matches", []):
                 marker = cite(match)
                 if marker:
-                    lines.append(f"- {match['name']} {marker}")
+                    properties = match.get("properties", {})
+                    details = ", ".join(
+                        f"{key}: {value}" for key, value in properties.items()
+                        if value is not None and isinstance(value, (str, int, float, bool))
+                    ) if isinstance(properties, dict) else ""
+                    suffix = f" ({details})" if details else ""
+                    lines.append(f"- {match['name']} {marker}{suffix}")
             if lines:
                 answer = "Matching graph nodes:\n" + "\n".join(lines)
-                break
-        if tool_name == "run_readonly_cypher":
-            lines = []
-            for row in result.get("rows", [])[:20]:
-                citation = _row_citation(row)
-                if citation:
-                    marker = cite(citation)
-                    details = ", ".join(f"{k}: {v}" for k, v in row.items() if not isinstance(v, (dict, list)))
-                    lines.append(f"- {details} {marker}")
-            if lines:
-                answer = "Query results:\n" + "\n".join(lines)
                 break
         if tool_name == "aggregate":
             lines = []
@@ -471,6 +586,7 @@ def synthesize(state: AgentState) -> AgentState:
                     lines.append(f"- {group['group_value']}: {group['metric_value']} {' '.join(markers)}")
             answer = "Grouped results:\n" + "\n".join(lines) if lines else "The aggregate result contained no citable nodes."
             break
+
     if citations and results:
         try:
             from .llm import synthesize_from_evidence

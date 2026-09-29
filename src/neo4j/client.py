@@ -87,11 +87,31 @@ class Neo4jClient:
             raise ValueError("Unterminated Cypher string or comment")
         return "".join(out)
 
-    def _validate_read_only(self, query: str) -> bool:
+    @classmethod
+    def _normalize_read_only_query(cls, query: str) -> Optional[str]:
+        """Remove one optional terminal statement delimiter; reject embedded delimiters."""
         if not isinstance(query, str) or not query.strip():
+            return None
+        try:
+            code = cls._mask_literals_and_comments(query)
+        except ValueError:
+            return None
+        semicolons = [index for index, char in enumerate(code) if char == ";"]
+        if not semicolons:
+            return query
+        if len(semicolons) != 1:
+            return None
+        delimiter = semicolons[0]
+        if code[delimiter + 1:].strip():
+            return None
+        return (query[:delimiter] + query[delimiter + 1:]).rstrip()
+
+    def _validate_read_only(self, query: str) -> bool:
+        normalized = self._normalize_read_only_query(query)
+        if normalized is None:
             return False
         try:
-            code = self._mask_literals_and_comments(query)
+            code = self._mask_literals_and_comments(normalized)
         except ValueError:
             return False
         if ";" in code:
@@ -112,18 +132,20 @@ class Neo4jClient:
         return self._driver.session(database=self._database, default_access_mode=READ_ACCESS)
 
     def run_read_query(self, query: str, parameters: dict[str, Any] | None = None) -> tuple[list[dict], ResultSummary]:
-        if not self._validate_read_only(query):
+        normalized = self._normalize_read_only_query(query)
+        if normalized is None or not self._validate_read_only(normalized):
             raise ValueError("Only one read-only Cypher statement is allowed")
         with self._session() as session:
-            result = session.run(query, parameters or {})
+            result = session.run(normalized, parameters or {})
             records = [dict(record) for record in result]
             return records, result.consume()
 
     def explain(self, query: str) -> bool:
-        if not self._validate_read_only(query):
+        normalized = self._normalize_read_only_query(query)
+        if normalized is None or not self._validate_read_only(normalized):
             raise ValueError("Only one read-only Cypher statement is allowed")
         with self._session() as session:
-            session.run("EXPLAIN " + query).consume()
+            session.run("EXPLAIN " + normalized).consume()
         return True
 
 

@@ -44,11 +44,53 @@ def test_agent_stops_after_citable_exploratory_result():
     from langchain_core.messages import ToolMessage
     state = _state(1)
     state["messages"] = [ToolMessage(
-        content=json.dumps({"status": "ok", "rows": [{"productID": "1", "productName": "Chai", "revenue": 10.0}]}),
+        content=json.dumps({"status": "ok", "rows": [{
+            "values": {"productID": "1", "productName": "Chai", "revenue": 10.0},
+            "evidence": {"nodes": [{"label": "Product", "key": "1", "name": "Chai", "properties": {}}], "edges": []},
+        }]}),
         name="run_readonly_cypher", tool_call_id="call-1",
     )]
     with patch("src.agents.llm.generate_agent_response") as model:
         update = agent_step(state, {"run_readonly_cypher": lambda **kwargs: None})
     model.assert_not_called()
     assert update["loop_count"] == 1
+    assert update["messages"][0].content.startswith("FINAL:")
+
+
+def test_agent_stops_after_exploratory_count_with_evidence_nodes():
+    import json
+    from langchain_core.messages import ToolMessage
+    state = _state(2)
+    state["messages"] = [ToolMessage(
+        content=json.dumps({"status": "ok", "rows": [{
+            "values": {
+                "order_count": 2,
+                "anchor": {"label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste"},
+            },
+            "evidence": {"nodes": [
+                {"label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste", "properties": {}},
+                {"label": "Order", "key": "1", "name": "1", "properties": {}},
+                {"label": "Order", "key": "2", "name": "2", "properties": {}},
+            ], "edges": []},
+        }]}),
+        name="run_readonly_cypher", tool_call_id="call-count",
+    )]
+    with patch("src.agents.llm.generate_agent_response") as model:
+        update = agent_step(state, {"run_readonly_cypher": lambda **kwargs: None})
+    model.assert_not_called()
+    assert update["loop_count"] == 2
+    assert update["messages"][0].content.startswith("FINAL:")
+
+
+def test_agent_stops_after_exploratory_query_failure():
+    import json
+    from langchain_core.messages import ToolMessage
+    state = _state(2)
+    state["messages"] = [ToolMessage(
+        content=json.dumps({"status": "invalid", "error": "semicolon rejected", "rows": [], "attempts": []}),
+        name="run_readonly_cypher", tool_call_id="call-invalid",
+    )]
+    with patch("src.agents.llm.generate_agent_response") as model:
+        update = agent_step(state, {"run_readonly_cypher": lambda **kwargs: None})
+    model.assert_not_called()
     assert update["messages"][0].content.startswith("FINAL:")

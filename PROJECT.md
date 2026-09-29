@@ -72,11 +72,11 @@ General rules for all tools: inputs are str / str | None / enums only. Outputs a
 **Mode:** retrieval (rubric-neutral)
 **Statuses:** ok | empty | invalid
 
-**Semantics.** Resolves a natural-language mention to graph nodes. `label`: optional, one of the nine labels in SCHEMA.md; if omitted all labels are searched; an invalid label value returns status "invalid".
+**Semantics.** Resolves a natural-language mention to graph nodes. `label`: optional, one of the nine labels in SCHEMA.md; if omitted all labels are searched; an invalid label value returns status "invalid". With a label supplied, an input equal to a node's canonical key is also resolved by exact key after exact display-name matching and before contains/fuzzy name matching. Key inputs and display names use the same output payload.
 
 **Output schema.** `{ status, query_name, matches: [{ label, key, name, match, properties }] }` — `label + key` is the canonical node handle consumed by all other tools and by citations; `match` ∈ {"exact", "contains", "fuzzy"}; matches ordered best-first, capped at 10.
 
-**Invariants.** (1) Fixed cascade: exact on the label's name property → case-insensitive contains → fuzzy; the `match` field always reports the tier used. (2) Empty is normal: status "empty", matches [], no invented matches. (3) Read-only.
+**Invariants.** (1) Fixed cascade: exact display name → exact canonical key when `label` is supplied → case-insensitive contains → fuzzy; the `match` field reports `exact` for either exact name or key resolution and otherwise reports the name tier used. (2) Empty is normal: status "empty", matches [], no invented matches. (3) Read-only.
 
 **NOT contractual:** the fuzzy algorithm, the per-label property subset, the Cypher of each cascade stage.
 
@@ -84,7 +84,7 @@ General rules for all tools: inputs are str / str | None / enums only. Outputs a
 
 ```json
 { "status": "ok", "query_name": "Exotic Liquids",
-  "matches": [ { "label": "Supplier", "key": "Exotic Liquids", "name": "Exotic Liquids",
+  "matches": [ { "label": "Supplier", "key": "1", "name": "Exotic Liquids",
                  "match": "exact", "properties": { "country": "UK" } } ] }
 ```
 
@@ -174,20 +174,59 @@ The synthesize node (not the tool) computes the ~5-month gap pattern from these 
 
 **Semantics.** The agent writes Cypher itself. Pipeline: read-only guard → EXPLAIN validation → execute → return rows. Exactly ONE retry on validation or execution failure; the retry receives the error message.
 
-**Output schema.** `{ status, query, attempts: [{ cypher, valid, error | None }], rows: [...] }` — `attempts` records the failed first try and the retry; the trace drawer displays both.
+**Output schema.** Every response uses this envelope:
 
-**Invariants.** (1) Read-only enforcement: reject any statement that is not a single READ query. (2) `retry_count ≤ 1` — after one failed retry, status is retry_failed and no further attempts. (3) Empty result is a legitimate outcome (status "empty"), never an error. (4) The schema available to the generator is extracted from SCHEMA.md.
+```json
+{
+  "status": "ok",
+  "query": "the original query supplied to the tool",
+  "attempts": [
+    { "cypher": "attempted query", "valid": true, "error": null }
+  ],
+  "rows": [
+    {
+      "values": { "customer_count": 1 },
+      "evidence": {
+        "nodes": [
+          { "label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste", "properties": {} }
+        ],
+        "edges": []
+      }
+    }
+  ],
+  "error": null
+}
+```
 
-**NOT contractual:** the prompt engineering of the generator, the exact validation regexes (EXPLAIN is the gate).
+`rows` is always a list of normalized row objects. `values` preserves the returned Cypher columns and their scalar or nested values. A returned node is converted to the canonical `{label, key, name, properties}` object; a returned relationship is converted to `{type, from: {label, key}, to: {label, key}, properties}`. A returned path is represented in its value as `{nodes: [...], edges: [...]}` using those same canonical objects. `evidence.nodes` and `evidence.edges` collect and deduplicate graph entities found anywhere in that row's values. This supports scalar-only rows, node or relationship rows, paths/subgraphs, and mixtures of scalars and graph entities without changing the row envelope. Scalar-only results have empty evidence arrays. For a scalar metric or count, the query should also return the contributing nodes or relationships needed to support the claim; the agent may make a graph claim only when it has adequate node-backed evidence under §3.
 
-**Example.** Agent wants revenue split by product for a supplier, writes invalid Cypher (wrong relationship direction), retries. Call: `run_readonly_cypher(query="MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[l:ORDERS]-(o:Order) WHERE s.companyName = 'Exotic Liquids' RETURN p.productName, sum(l.quantity * l.unitPrice)")` →
+`query` always preserves the original input. `attempts` records each validation/EXPLAIN/execution attempt, including the error for each failed attempt. `error` is `null` for `ok`, `retry_ok`, and `empty`; it contains the terminal failure reason for `invalid` and `retry_failed`. A successful query with zero records is `empty`, with `rows: []` and no error. A query rejected before execution or still failing after its one retry has `rows: []` and a non-empty `error`. `attempts` is the trace drawer's source for the failure-and-recovery details.
+
+**Invariants.** (1) Read-only enforcement: reject any statement that is not a single READ query. (2) `retry_count ≤ 1` — after one failed retry, status is retry_failed and no further attempts. (3) Empty result is a legitimate outcome (status "empty"), never an error; it is distinct from invalid or retry_failed. (4) The schema available to the generator is extracted from SCHEMA.md. (5) Every graph entity in the returned values is normalized and included in that row's evidence, deduplicated by canonical node identity or edge type/endpoints/properties.
+
+**NOT contractual:** the prompt engineering of the generator, the exact validation regexes (EXPLAIN is the gate), and the internal normalization implementation.
+
+**Example.** Agent wants revenue split by product for a supplier, writes invalid Cypher (wrong relationship direction), retries. The corrected query returns both scalar metrics and their graph evidence: `run_readonly_cypher(query="MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[l:ORDERS]-(o:Order) WHERE s.companyName = 'Exotic Liquids' RETURN s AS supplier, p AS product, sum(l.quantity * l.unitPrice) AS revenue, collect(DISTINCT o) AS evidence_orders")` →
 
 ```json
 { "status": "retry_ok",
+  "query": "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[l:ORDERS]-(o:Order) WHERE s.companyName = 'Exotic Liquids' RETURN s AS supplier, p AS product, sum(l.quantity * l.unitPrice) AS revenue, collect(DISTINCT o) AS evidence_orders",
   "attempts": [
     { "cypher": "MATCH (s:Supplier)-[:ORDERS]->(p:Product) ...", "valid": false, "error": "Relationship type ORDERS does not exist from Supplier" },
     { "cypher": "MATCH (s:Supplier)-[:SUPPLIES]->(p:Product)<-[l:ORDERS]-(o:Order) WHERE s.companyName = 'Exotic Liquids' ...", "valid": true, "error": null } ],
-  "rows": [ { "p.productName": "Chai", "revenue": 12000.0 } ] }
+  "rows": [
+    { "values": {
+        "supplier": { "label": "Supplier", "key": "1", "name": "Exotic Liquids", "properties": {} },
+        "product": { "label": "Product", "key": "1", "name": "Chai", "properties": {} },
+        "revenue": 12000.0,
+        "evidence_orders": [ { "label": "Order", "key": "10643", "name": "10643", "properties": {} } ] },
+      "evidence": { "nodes": [
+          { "label": "Supplier", "key": "1", "name": "Exotic Liquids", "properties": {} },
+          { "label": "Product", "key": "1", "name": "Chai", "properties": {} },
+          { "label": "Order", "key": "10643", "name": "10643", "properties": {} } ],
+        "edges": [] } }
+  ],
+  "error": null }
 ```
 
 Note the exploratory tool takes a raw string — the agent cannot bind Cypher parameters, so literals are inlined (parameter injection is a curated-tool privilege; the read-only guard and SCHEMA.md whitelist are the safety net). `attempts` is the trace drawer's display of the failure-and-recovery story, and the rubric caps this run at 0.5.
@@ -254,9 +293,9 @@ Three panels:
 
 - **Chat**: st.chat_message, history in session_state, driver and compiled graph in st.cache_resource.
 - **Trace drawer** (expander): route badge, one row per ToolCallRecord (tool, mode, status, Cypher for exploratory, latency, retries), confidence + rationale + the rubric rule that fired.
-- **Graph panel**: streamlit-agraph rendering the evidence subgraph of the last tool call; colors per label; cited nodes enlarged; node click → property card (name + properties).
+- **Graph panel**: streamlit-agraph rendering the graph evidence from the last tool call; colors per label; cited nodes enlarged; node click → property card (name + properties). For curated tools, graph evidence comes from their `subgraph`. For `run_readonly_cypher`, the panel combines `evidence.nodes` and `evidence.edges` across the last tool result's normalized rows.
 
-Panel contracts: the drawer reads `trace` and `confidence_rationale` verbatim from state; the graph panel renders only the last tool call's subgraph (it is evidence, not an explorer); cited nodes are enlarged exactly per `citations`.
+Panel contracts: the drawer reads `trace` and `confidence_rationale` verbatim from state; the graph panel renders only graph evidence from the last tool call (it is evidence, not an explorer); cited nodes are enlarged exactly per `citations`.
 
 ## 8. Tech constraints
 

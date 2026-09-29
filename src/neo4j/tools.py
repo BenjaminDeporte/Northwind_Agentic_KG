@@ -15,8 +15,9 @@ SCHEMA.md Addendum (applied):
 - orderDate format: "1997-08-25 00:00:00.000" (with milliseconds)
 """
 
-from typing import Any, Optional
+import json
 from enum import Enum
+from typing import Any, Optional
 
 from .client import client, Neo4jClient
 
@@ -114,7 +115,7 @@ def _lookup_name_expression(label: str) -> str:
 
 
 def lookup_entity(name: str, label: Optional[str] = None) -> dict:
-    """Resolve a mention across all nine labels with exact/contains/fuzzy tiers."""
+    """Resolve a label-scoped key or name, or search names across all labels."""
     if label is not None and label not in VALID_LABELS:
         return {"status": "invalid", "query_name": name, "matches": []}
     if not isinstance(name, str) or not name.strip():
@@ -134,19 +135,42 @@ def lookup_entity(name: str, label: Optional[str] = None) -> dict:
         return {"label": node_label, "key": str(props.get(key_prop, "")), "name": display_name,
                 "match": tier, "properties": _filter_properties(remaining, node_label)}
 
-    for tier in ("exact", "contains"):
-        found = []
-        for node_label in labels:
-            expression = _lookup_name_expression(node_label)
-            predicate = f"{expression} = $name" if tier == "exact" else f"toLower({expression}) CONTAINS toLower($name)"
-            query = f"MATCH (n:{node_label}) WHERE {predicate} RETURN n"
-            try:
-                rows, _ = client.run_read_query(query, {"name": name})
-            except Exception:
-                return {"status": "invalid", "query_name": name, "matches": []}
-            found.extend(payload(row["n"], node_label, tier) for row in rows)
-        if found:
-            return {"status": "ok", "query_name": name, "matches": found[:10]}
+    # Preserve the exact display-name tier as the highest-priority name match.
+    found = []
+    for node_label in labels:
+        expression = _lookup_name_expression(node_label)
+        query = f"MATCH (n:{node_label}) WHERE {expression} = $name RETURN n"
+        try:
+            rows, _ = client.run_read_query(query, {"name": name})
+        except Exception:
+            return {"status": "invalid", "query_name": name, "matches": []}
+        found.extend(payload(row["n"], node_label, "exact") for row in rows)
+    if found:
+        return {"status": "ok", "query_name": name, "matches": found[:10]}
+
+    # A supplied label makes an exact canonical-key lookup unambiguous. toString
+    # supports Northwind key properties stored as either strings or integers.
+    if label is not None:
+        key_property = LABEL_TO_KEY[label]
+        query = f"MATCH (n:{label}) WHERE toString(n.{key_property}) = $name RETURN n"
+        try:
+            rows, _ = client.run_read_query(query, {"name": name})
+        except Exception:
+            return {"status": "invalid", "query_name": name, "matches": []}
+        if rows:
+            matches = [payload(row["n"], label, "exact") for row in rows]
+            return {"status": "ok", "query_name": name, "matches": matches[:10]}
+
+    for node_label in labels:
+        expression = _lookup_name_expression(node_label)
+        query = f"MATCH (n:{node_label}) WHERE toLower({expression}) CONTAINS toLower($name) RETURN n"
+        try:
+            rows, _ = client.run_read_query(query, {"name": name})
+        except Exception:
+            return {"status": "invalid", "query_name": name, "matches": []}
+        found.extend(payload(row["n"], node_label, "contains") for row in rows)
+    if found:
+        return {"status": "ok", "query_name": name, "matches": found[:10]}
 
     fuzzy = []
     for node_label in labels:
@@ -617,18 +641,100 @@ def _repair_cypher(query: str, error: str) -> str:
     return candidate
 
 
-def _cypher_json(value):
-    if hasattr(value, "labels"):
-        labels = sorted(value.labels)
-        label = labels[0] if labels else ""
-        if label in LABEL_TO_KEY:
-            return _node_payload(value, label)
-        return dict(value)
+def _json_safe(value):
+    """Convert non-graph Cypher values into JSON-safe scalars or containers."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, dict):
-        return {k: _cypher_json(v) for k, v in value.items()}
+        return {str(key): _json_safe(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_cypher_json(v) for v in value]
-    return value
+        return [_json_safe(item) for item in value]
+    if hasattr(value, "iso_format"):
+        return value.iso_format()
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
+def _cypher_node_payload(node) -> dict:
+    """Return a canonical node with all of its JSON-safe properties."""
+    labels = sorted(label for label in node.labels if label in LABEL_TO_KEY)
+    if not labels:
+        raise ValueError("Returned node has no supported Northwind label")
+    label = labels[0]
+    properties = {key: _json_safe(value) for key, value in dict(node).items()}
+    key_property = LABEL_TO_KEY[label]
+    key = properties.get(key_property)
+    if key is None:
+        raise ValueError(f"Returned {label} node is missing key property {key_property}")
+    if label == "Employee":
+        name = " ".join(filter(None, [properties.get("firstName"), properties.get("lastName")]))
+    elif label == "Order":
+        name = str(key)
+    else:
+        name_property = LABEL_TO_NAME[label]
+        name = str(properties.get(name_property) or key)
+    return {"label": label, "key": str(key), "name": name, "properties": properties}
+
+
+def _cypher_edge_payload(relationship, evidence: dict) -> dict:
+    """Normalize a returned Neo4j relationship and collect its endpoint nodes."""
+    start = _cypher_node_payload(relationship.start_node)
+    end = _cypher_node_payload(relationship.end_node)
+    edge = {
+        "type": str(relationship.type),
+        "from": {"label": start["label"], "key": start["key"]},
+        "to": {"label": end["label"], "key": end["key"]},
+        "properties": {key: _json_safe(value) for key, value in dict(relationship).items()},
+    }
+    _add_evidence_node(evidence, start)
+    _add_evidence_node(evidence, end)
+    _add_evidence_edge(evidence, edge)
+    return edge
+
+
+def _add_evidence_node(evidence: dict, node: dict) -> None:
+    identity = (node["label"], node["key"])
+    if identity not in evidence["_node_ids"]:
+        evidence["_node_ids"].add(identity)
+        evidence["nodes"].append(node)
+
+
+def _add_evidence_edge(evidence: dict, edge: dict) -> None:
+    identity = json.dumps(edge, sort_keys=True, separators=(",", ":"))
+    if identity not in evidence["_edge_ids"]:
+        evidence["_edge_ids"].add(identity)
+        evidence["edges"].append(edge)
+
+
+def _normalize_cypher_value(value, evidence: dict):
+    """Normalize graph entities recursively while retaining returned column structure."""
+    if hasattr(value, "nodes") and hasattr(value, "relationships"):
+        nodes = [_cypher_node_payload(node) for node in value.nodes]
+        edges = [_cypher_edge_payload(edge, evidence) for edge in value.relationships]
+        for node in nodes:
+            _add_evidence_node(evidence, node)
+        return {"nodes": nodes, "edges": edges}
+    if hasattr(value, "labels"):
+        node = _cypher_node_payload(value)
+        _add_evidence_node(evidence, node)
+        return node
+    if hasattr(value, "start_node") and hasattr(value, "end_node") and hasattr(value, "type"):
+        return _cypher_edge_payload(value, evidence)
+    if isinstance(value, dict):
+        return {str(key): _normalize_cypher_value(item, evidence) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_cypher_value(item, evidence) for item in value]
+    return _json_safe(value)
+
+
+def _normalize_cypher_row(record: dict) -> dict:
+    evidence = {"nodes": [], "edges": [], "_node_ids": set(), "_edge_ids": set()}
+    values = _normalize_cypher_value(dict(record), evidence)
+    return {
+        "values": values,
+        "evidence": {"nodes": evidence["nodes"], "edges": evidence["edges"]},
+    }
 
 
 def _validate_schema_cypher(query: str) -> str | None:
@@ -668,8 +774,9 @@ def run_readonly_cypher(query: str) -> dict:
     """Validate, run, and at most once repair a read-only Cypher query."""
     attempts = []
     if not client._validate_read_only(query):
-        attempts.append({"cypher": query, "valid": False, "error": "Only one read-only query is allowed"})
-        return {"status": "invalid", "query": query, "attempts": attempts, "rows": []}
+        error = "Only one read-only query is allowed"
+        attempts.append({"cypher": query, "valid": False, "error": error})
+        return {"status": "invalid", "query": query, "attempts": attempts, "rows": [], "error": error}
     candidate = query
     for index in range(2):
         if index == 1:
@@ -688,12 +795,13 @@ def run_readonly_cypher(query: str) -> dict:
             if not client.explain(candidate):
                 raise ValueError("EXPLAIN validation failed")
             records, _ = client.run_read_query(candidate)
+            rows = [_normalize_cypher_row(dict(record)) for record in records]
             attempts.append({"cypher": candidate, "valid": True, "error": None})
-            rows = [_cypher_json(dict(record)) for record in records]
             return {
                 "status": ("retry_ok" if index else "ok") if rows else "empty",
-                "query": query, "attempts": attempts, "rows": rows,
+                "query": query, "attempts": attempts, "rows": rows, "error": None,
             }
         except Exception as exc:
             attempts.append({"cypher": candidate, "valid": False, "error": str(exc)})
-    return {"status": "retry_failed", "query": query, "attempts": attempts, "rows": []}
+    error = attempts[-1]["error"] if attempts else "Query execution failed"
+    return {"status": "retry_failed", "query": query, "attempts": attempts, "rows": [], "error": error}

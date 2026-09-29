@@ -135,7 +135,7 @@ RULES:
 5. Be accurate and cite specific data from the tools.
 
 AVAILABLE TOOLS with their exact parameter names:
-- lookup_entity(name: str, label: str | None = None) -> Find entities by name
+- lookup_entity(name: str, label: str | None = None) -> Find entities by name or exact label-scoped key
 - impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> Analyze impact
 - co_purchase(product_key: str) -> Find co-purchased products
 - customer_history(customer_key: str) -> Get customer order history
@@ -155,12 +155,16 @@ FINAL: <your final answer>
 
 IMPORTANT: 
 - Use EXACT parameter names as listed above
-- For lookup_entity: use {{"name": "entity name", "label": "NodeLabel"}}
+- For lookup_entity: use {{"name": "entity name or canonical key", "label": "NodeLabel"}}. If the question supplies a node key (for example customerID ALFKI), pass that key as name with the matching label. For a display name, pass the name with the matching label when known.
 - For impact_analysis: use {{"entity_key": "id", "entity_label": "NodeLabel", "direction": "out", "depth": 3}}
 - For customer_history: use {{"customer_key": "customerID"}}
 - For co_purchase: use {{"product_key": "productID"}}
 - For aggregate: use {{"label": "NodeLabel", "group_by": "property", "metric": "sum_revenue"}}
 - For run_readonly_cypher: use {{"query": "CYPHER QUERY"}}
+- aggregate is only for grouped results; never use a constant such as "1" for group_by.
+- For any count from run_readonly_cypher, return the count and every counted node as evidence_nodes. When the count is scoped to an entity, also return that anchor node. Use a count alias such as order_count. Example: MATCH (c:Customer {{customerID: 'ALFKI'}})-[:PURCHASED]->(o:Order) RETURN c AS anchor, count(o) AS order_count, collect(o) AS evidence_nodes.
+- For a whole-dataset entity count, use run_readonly_cypher, e.g. MATCH (c:Customer) RETURN count(c) AS customer_count, collect(c) AS evidence_nodes.
+- For order-count questions about a customer whose customerID is given, call customer_history directly; do not lookup_entity by that ID.
 - json_arguments must be valid JSON
 - Use the key returned by lookup_entity, never a guessed key.
 - Exploratory Product queries must return productID and productName alongside measures so results can be cited.
@@ -174,7 +178,7 @@ AGENT_SYSTEM_PROMPT = """
 You are an AI assistant for the Northwind knowledge graph. Answer questions using the available tools.
 
 You have access to these tools:
-- lookup_entity: Find entities by name (exact, contains, or fuzzy match)
+- lookup_entity: Find entities by name (exact, contains, or fuzzy match), or by exact canonical key when a label is supplied
 - impact_analysis: Analyze impact of an entity failure
 - co_purchase: Find products frequently bought together
 - customer_history: Get a customer's order history

@@ -7,7 +7,10 @@ PLAN.md 2.6 — produces final answer from tool results
 Testing strategy: Mocked, deterministic, no API calls.
 """
 
+import json
+
 import pytest
+from langchain_core.messages import ToolMessage
 
 from src.agents.nodes import synthesize
 from src.agents.state import ROUTE_AGENT, ROUTE_CHITCHAT, ROUTE_REFUSAL, ROUTE_DEGRADE, STATUS_OK
@@ -310,3 +313,104 @@ class TestSynthesizeToolTypes:
         }
         result = synthesize(state)
         assert result['answer'] is not None
+
+
+class TestExploratoryScalarEvidence:
+    def test_dataset_count_uses_scalar_and_all_returned_nodes(self, monkeypatch):
+        """A scalar count is answerable when its row also carries node evidence."""
+        monkeypatch.setattr(
+            "src.agents.llm.synthesize_from_evidence",
+            lambda draft: draft,
+        )
+        evidence_nodes = [
+            {"label": "Customer", "key": key, "name": name, "properties": {}}
+            for key, name in [("ALFKI", "Alfreds Futterkiste"), ("ANATR", "Ana Trujillo Emparedados")]
+        ]
+        payload = {
+            "status": "ok",
+            "query": "MATCH (c:Customer) RETURN count(c) AS customer_count, collect(c) AS evidence_nodes",
+            "rows": [{"values": {"customer_count": 2}, "evidence": {"nodes": evidence_nodes, "edges": []}}],
+        }
+        state = {
+            "question": "How many customers are in the dataset?",
+            "route": ROUTE_AGENT,
+            "messages": [ToolMessage(content=json.dumps(payload), name="run_readonly_cypher", tool_call_id="count")],
+            "trace": [{
+                "step": 1, "tool_name": "run_readonly_cypher", "args": {},
+                "mode": "exploratory", "status": "ok", "result_rows": 1,
+                "cypher": payload["query"], "latency_ms": 1, "retry_count": 0,
+            }],
+            "loop_count": 1,
+        }
+
+        result = synthesize(state)
+
+        assert "contains 2 customers" in result["answer"]
+        assert "[Customer:ALFKI]" in result["answer"]
+        assert "[Customer:ANATR]" in result["answer"]
+        assert {item["key"] for item in result["citations"]} == {"ALFKI", "ANATR"}
+
+
+    def test_scoped_order_count_uses_order_nodes_and_customer_anchor(self, monkeypatch):
+        monkeypatch.setattr("src.agents.llm.synthesize_from_evidence", lambda draft: draft)
+        payload = {"status": "ok", "rows": [{
+            "values": {
+                "order_count": 2,
+                "anchor": {"label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste"},
+            },
+            "evidence": {"nodes": [
+                {"label": "Customer", "key": "ALFKI", "name": "Alfreds Futterkiste", "properties": {}},
+                {"label": "Order", "key": "1", "name": "1", "properties": {}},
+                {"label": "Order", "key": "2", "name": "2", "properties": {}},
+            ], "edges": []},
+        }]}
+        state = {
+            "question": "How many orders did customer ALFKI place?",
+            "route": ROUTE_AGENT,
+            "messages": [ToolMessage(content=json.dumps(payload), name="run_readonly_cypher", tool_call_id="orders")],
+            "trace": [], "loop_count": 2,
+        }
+        result = synthesize(state)
+        assert "Alfreds Futterkiste [Customer:ALFKI] placed 2 orders." in result["answer"]
+        assert "[Order:1]" in result["answer"] and "[Order:2]" in result["answer"]
+        assert {item["label"] for item in result["citations"]} == {"Customer", "Order"}
+
+
+class TestExploratoryOutcomes:
+    def _state(self, payload, *, earlier_messages=()):
+        messages = list(earlier_messages) + [ToolMessage(
+            content=json.dumps(payload), name="run_readonly_cypher", tool_call_id="explore",
+        )]
+        return {"question": "show info", "route": ROUTE_AGENT, "messages": messages, "trace": [], "loop_count": 2}
+
+    def test_successful_empty_query_is_distinct(self):
+        result = synthesize(self._state({"status": "empty", "rows": [], "error": None, "attempts": []}))
+        assert result["answer"] == "The graph query ran successfully but returned no matching rows."
+
+    def test_invalid_query_is_distinct_from_prior_empty_lookup(self):
+        from langchain_core.messages import ToolMessage
+        earlier = ToolMessage(
+            content=json.dumps({"status": "empty", "matches": []}),
+            name="lookup_entity", tool_call_id="lookup",
+        )
+        state = self._state(
+            {"status": "invalid", "rows": [], "error": "Unknown property: contactTitle", "attempts": []},
+            earlier_messages=(earlier,),
+        )
+        state["trace"] = [
+            {"step": 1, "tool_name": "lookup_entity", "args": {}, "mode": "retrieval", "status": "empty", "result_rows": 0, "cypher": None, "latency_ms": 1, "retry_count": 0},
+            {"step": 2, "tool_name": "run_readonly_cypher", "args": {}, "mode": "exploratory", "status": "invalid", "result_rows": 0, "cypher": "MATCH (c:Customer) RETURN c.contactTitle", "latency_ms": 0, "retry_count": 0},
+        ]
+        result = synthesize(state)
+        assert "rejected before execution" in result["answer"]
+        assert "Unknown property: contactTitle" in result["answer"]
+        assert "no matching" not in result["answer"]
+        assert [item["status"] for item in state["trace"]] == ["empty", "invalid"]
+        assert result["citations"] == []
+
+    def test_scalar_only_result_does_not_claim_uncited_number(self):
+        result = synthesize(self._state({
+            "status": "ok", "rows": [{"values": {"customer_count": 91}, "evidence": {"nodes": [], "edges": []}}],
+        }))
+        assert "91" not in result["answer"]
+        assert "no node evidence" in result["answer"]
