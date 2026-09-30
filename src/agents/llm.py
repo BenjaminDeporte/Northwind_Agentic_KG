@@ -1,15 +1,19 @@
 """
 LLM client for the Northwind Agentic KG.
 
-Uses Mistral AI models per PROJECT.md: small for classify, large for agent loop and synthesis.
+Uses Mistral AI models per PROJECT.md: small for classify, large for agent loop, synthesis, and consistency checking.
 
 Authoritative contracts:
 - PROJECT.md §2: Architecture (classify uses small LLM, agent uses large LLM)
 - PROJECT.md §8: Tech constraints (Mistral models)
 """
 
+import json
 import os
+import re
 from typing import Any
+
+from dotenv import load_dotenv
 
 # Handle different mistralai package versions
 try:
@@ -19,27 +23,47 @@ except ImportError:
 
 
 # =============================================================================
-# CLIENT SETUP
-# =============================================================================
-
-def get_mistral_client() -> Mistral:
-    """Get or create Mistral client instance."""
-    api_key = os.getenv("MISTRAL_API_KEY")
-    if not api_key:
-        raise ValueError(
-            "MISTRAL_API_KEY must be set in .env for Gate 1 and beyond. "
-            "Phase 2 uses mocked implementations that don't require LLM access."
-        )
-    return Mistral(api_key=api_key)
-
-
-# =============================================================================
 # MODEL CONFIGURATION
 # =============================================================================
 
-# Model names per PROJECT.md
-MODEL_CLASSIFY = "mistral-small-latest"  # Small LLM for routing
-MODEL_AGENT = "mistral-large-latest"    # Large LLM for ReAct loop and synthesis
+MODEL_CLASSIFY = "mistral-small-latest"
+MODEL_AGENT = "mistral-large-latest"
+
+
+# =============================================================================
+# CLIENT SETUP
+# =============================================================================
+
+def get_mistral_client(api_key: str | None = None) -> Mistral:
+    """Create a client from an explicit key or MISTRAL_API_KEY in the environment/.env."""
+    if api_key is None:
+        load_dotenv()
+    resolved_key = api_key.strip() if isinstance(api_key, str) and api_key.strip() else None
+    resolved_key = resolved_key or os.getenv("MISTRAL_API_KEY")
+    if not resolved_key:
+        raise ValueError(
+            "Pass api_key or set MISTRAL_API_KEY in .env to use the Mistral API."
+        )
+    return Mistral(api_key=resolved_key)
+
+
+def complete_mistral_chat(
+    *,
+    messages: list[dict[str, str]],
+    api_key: str | None = None,
+    model_name: str | None = None,
+    temperature: float = 0.0,
+    max_tokens: int = 1000,
+):
+    """Send a chat request; model selection is per request, independent of the key."""
+    selected_model = model_name.strip() if isinstance(model_name, str) and model_name.strip() else MODEL_AGENT
+    client = get_mistral_client(api_key=api_key)
+    return client.chat.complete(
+        model=selected_model,
+        messages=messages,
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
 
 
 # =============================================================================
@@ -79,7 +103,7 @@ IMPORTANT: Respond ONLY with valid JSON. Do NOT add any other text, explanations
 """
 
 
-def classify_with_llm(question: str) -> dict[str, Any]:
+def classify_with_llm(question: str, api_key: str | None = None) -> dict[str, Any]:
     """
     Classify a question using the small LLM.
     
@@ -91,17 +115,16 @@ def classify_with_llm(question: str) -> dict[str, Any]:
     Returns:
         Dictionary with 'route' key, and optionally 'answer' for chitchat/refusal
     """
-    client = get_mistral_client()
-    
     messages = [
         {"role": "system", "content": CLASSIFY_SYSTEM_PROMPT},
         {"role": "user", "content": question},
     ]
-    
-    response = client.chat.complete(
-        model=MODEL_CLASSIFY,
+
+    response = complete_mistral_chat(
+        api_key=api_key,
+        model_name=MODEL_CLASSIFY,
         messages=messages,
-        temperature=0.0,  # Deterministic for routing
+        temperature=0.0,
         max_tokens=50,
     )
     
@@ -150,8 +173,9 @@ For each step, output your reasoning, then make a tool call using the format:
 THINK: <your reasoning>
 TOOL: <tool_name>({{json_arguments}})
 
-When you have enough information to answer, output:
-FINAL: <your final answer>
+When you believe you have enough information to address every requested part, output a candidate answer:
+FINAL: <candidate answer>
+The FINAL marker requests synthesis and a consistency check; it does not by itself mean the question has been fully answered.
 
 IMPORTANT: 
 - Use EXACT parameter names as listed above
@@ -161,41 +185,78 @@ IMPORTANT:
 - For co_purchase: use {{"product_key": "productID"}}
 - For aggregate: use {{"label": "NodeLabel", "group_by": "property", "metric": "sum_revenue"}}
 - For run_readonly_cypher: use {{"query": "CYPHER QUERY"}}
-- aggregate is only for grouped results; never use a constant such as "1" for group_by.
-- For any count from run_readonly_cypher, return the count and every counted node as evidence_nodes. When the count is scoped to an entity, also return that anchor node. Use a count alias such as order_count. Example: MATCH (c:Customer {{customerID: 'ALFKI'}})-[:PURCHASED]->(o:Order) RETURN c AS anchor, count(o) AS order_count, collect(o) AS evidence_nodes.
-- For a whole-dataset entity count, use run_readonly_cypher, e.g. MATCH (c:Customer) RETURN count(c) AS customer_count, collect(c) AS evidence_nodes.
-- For order-count questions about a customer whose customerID is given, call customer_history directly; do not lookup_entity by that ID.
+- Choose tools from the operation the user asks you to perform, not from individual words such as "customer" or "product". Identify the requested subject(s), relationship or comparison, filters, and result shape before choosing a tool.
+- Use customer_history when the intent is to retrieve the order history, order count, dates, or ordering pattern for one identified customer. It returns that customer's orders; it does not answer a comparison or intersection across multiple customers.
+- For questions asking which products are common/shared between named customers, use run_readonly_cypher to query all named customers and find products connected to each. Return the Product node and the customer IDs or other values needed to show the intersection, with relationship/node evidence. Example for SAVEA and ALFKI:
+  MATCH path = (c:Customer)-[:PURCHASED]->(:Order)-[:ORDERS]->(p:Product)
+  WHERE c.customerID IN ['SAVEA', 'ALFKI']
+  WITH p, c, collect(DISTINCT path)[0] AS evidence_path
+  WITH p, collect(c.customerID) AS customer_ids, collect(evidence_path) AS evidence_paths
+  WHERE size(customer_ids) = 2
+  RETURN p AS product, customer_ids, evidence_paths
+- More generally, a successful result for only one subject is incomplete when the question asks for a comparison, shared set, ranking across subjects, or another multi-part operation. Select a tool/query that represents every requested subject and operation; do not treat a tool as appropriate merely because its input mentions one word from the question.
+- aggregate is only for grouped results; its metric must be count, sum_revenue, or avg_revenue. Never use a made-up metric such as count_orders or a constant such as "1" for group_by.
+- For any count from run_readonly_cypher, return the count plus the anchor and at most three representative evidence nodes. Do not return all contributing records solely for citation. When the count is scoped to an entity, return the anchor node too. Use a count alias such as order_count. Always return node variables (for example c AS customer), not only scalar properties such as c.customerID or c.companyName; scalar-only rows cannot be cited. Example: MATCH (c:Customer {{customerID: 'ALFKI'}})-[:PURCHASED]->(o:Order) RETURN c AS customer, count(o) AS order_count, collect(DISTINCT o)[0..3] AS evidence_nodes.
+- For a whole-dataset entity count, use run_readonly_cypher, e.g. MATCH (c:Customer) RETURN count(c) AS customer_count, collect(DISTINCT c)[0..3] AS evidence_nodes.
+- For ranking customers by order count, use run_readonly_cypher and return the Customer node with the count and its order evidence: MATCH (c:Customer)-[:PURCHASED]->(o:Order) RETURN c AS customer, count(o) AS order_count, collect(DISTINCT o)[0..3] AS evidence_nodes ORDER BY order_count DESC LIMIT 1.
+- For “which customer ordered the most products?”, interpret “products” as distinct Product entities and count them per Customer: MATCH (c:Customer)-[:PURCHASED]->(:Order)-[:ORDERS]->(p:Product) RETURN c AS customer, count(DISTINCT p) AS product_count, collect(DISTINCT p)[0..3] AS evidence_products ORDER BY product_count DESC LIMIT 1. If the question explicitly asks for units, quantity, or volume, sum line.quantity instead and call the result total_quantity.
+- For a single-customer order count/history question where customerID is given, call customer_history directly; do not lookup_entity by that ID. Do not use this rule for questions comparing two or more customers or asking for products/records shared by them.
 - json_arguments must be valid JSON
 - Use the key returned by lookup_entity, never a guessed key.
-- Exploratory Product queries must return productID and productName alongside measures so results can be cited.
+- Exploratory queries that identify an entity must return the graph node variable itself (for example, p AS product), not only scalar key/name properties. A row containing only productID/productName or customerID/companyName has no citable node evidence.
+- For “most ordered product” or product order-volume rankings, use run_readonly_cypher and return the Product node with the summed quantity, for example: MATCH (p:Product)<-[line:ORDERS]-(o:Order) RETURN p AS product, sum(coalesce(line.quantity, 0)) AS total_quantity, collect(DISTINCT o)[0..3] AS evidence_nodes ORDER BY total_quantity DESC LIMIT 1.
 - Use run_readonly_cypher for ranked product revenue questions; aggregate is for group-by reporting.
+- If a successful result lacks evidence associated with its claim, make at most one recovery tool call for the same claim. Return the computed value and a relevant anchor or at most three representative graph nodes; do not return all contributors. If the recovery result still lacks relevant evidence, do not state the graph claim as fact.
 - Only use the tools listed above. Do NOT make up information.
 """
 
 
-# Simplified ReAct format for our implementation
-AGENT_SYSTEM_PROMPT = """
-You are an AI assistant for the Northwind knowledge graph. Answer questions using the available tools.
+def evaluate_answer_consistency(
+    *, question: str, candidate_answer: str, citations: list[dict], supporting_results: list[dict],
+    api_key: str | None = None, model_name: str | None = None,
+) -> dict[str, str]:
+    """Ask Mistral to check question coverage and evidence support for a draft."""
+    response = complete_mistral_chat(
+        api_key=api_key,
+        model_name=model_name,
+        messages=[
+            {"role": "system", "content": (
+                "You review a candidate answer to a Northwind knowledge-graph question. "
+                "Decide whether it answers every requested subject, comparison/operation, and constraint, "
+                "and whether its claims are supported by the provided tool results and citations. "
+                "A successful tool call alone is not sufficient. Reject answers that cover only one side "
+                "of a comparison, omit a requested filter or ranking, or claim more than the evidence shows. "
+                "Do not demand every contributing record. If the candidate explicitly abstains because evidence "
+                "is insufficient, accept the abstention. Return ONLY JSON: "
+                '{"decision":"pass"|"revise","feedback":"short actionable reason"}.'
+            )},
+            {"role": "user", "content": json.dumps({
+                "question": question,
+                "candidate_answer": candidate_answer,
+                "citations": citations,
+                "supporting_tool_results": supporting_results,
+            }, ensure_ascii=False, default=str)},
+        ],
+        temperature=0.0,
+        max_tokens=350,
+    )
+    try:
+        content = response if isinstance(response, str) else response.choices[0].message.content
+        text = str(content or "").strip()
+        if text.startswith("```"):
+            text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE)
+        start = text.find("{")
+        parsed, _ = json.JSONDecoder().raw_decode(text[start:])
+        decision = parsed.get("decision")
+        feedback = parsed.get("feedback")
+        if decision in {"pass", "revise"} and isinstance(feedback, str):
+            return {"decision": decision, "feedback": feedback[:500]}
+    except (AttributeError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+        pass
+    return {"decision": "revise", "feedback": "The consistency response was not valid JSON; review the answer against the question and evidence."}
 
-You have access to these tools:
-- lookup_entity: Find entities by name (exact, contains, or fuzzy match), or by exact canonical key when a label is supplied
-- impact_analysis: Analyze impact of an entity failure
-- co_purchase: Find products frequently bought together
-- customer_history: Get a customer's order history
-- aggregate: Compute aggregations (count, sum, avg)
-- run_readonly_cypher: Execute read-only Cypher queries
 
-Rules:
-1. Use tools to answer factual questions
-2. Think step by step
-3. Provide final answer in natural language
-4. Maximum 8 steps
-
-Think and plan your tool calls, then provide the final answer.
-"""
-
-
-def generate_agent_response(question: str, messages: list[dict], available_tools: list[str]) -> str:
+def generate_agent_response(question: str, messages: list[dict], *, api_key: str | None = None, model_name: str | None = None) -> str:
     """
     Generate an agent response using the large LLM.
     
@@ -203,34 +264,20 @@ def generate_agent_response(question: str, messages: list[dict], available_tools
     
     Args:
         question: The current question
-        messages: Previous messages in the conversation
-        available_tools: List of available tool names
+        messages: Previous conversation and tool-result messages
     
     Returns:
         The LLM's response text in ReAct format
     """
-    client = get_mistral_client()
-    
-    # Build tool descriptions
-    tool_descriptions = "\n".join([
-        f"{i+1}. {tool}: Available tool" 
-        for i, tool in enumerate(available_tools)
-    ])
-    
-    # Generate schema prompt
-    try:
-        from .schema_prompt import generate_schema_prompt
-        schema_prompt = generate_schema_prompt()
-    except Exception:
-        schema_prompt = "Northwind knowledge graph with Supplier, Product, Order, Customer nodes and SUPPLIES, ORDERS, PURCHASED relationships."
-    
-    # Build the system prompt with ReAct format instructions
+    # SCHEMA.md is authoritative. If its generated prompt projection fails,
+    # propagate the error instead of asking the model with a partial hardcoded schema.
+    from .schema_prompt import generate_schema_prompt
+    schema_prompt = generate_schema_prompt()
+
     system_prompt = AGENT_SYSTEM_PROMPT_TEMPLATE.format(
         max_steps=8,
-        tool_descriptions=tool_descriptions,
-        schema_prompt=schema_prompt
+        schema_prompt=schema_prompt,
     )
-    
     # Convert messages to Mistral format
     mistral_messages = [
         {"role": "system", "content": system_prompt},
@@ -264,8 +311,9 @@ def generate_agent_response(question: str, messages: list[dict], available_tools
     # Add current question
     mistral_messages.append({"role": "user", "content": question})
     
-    response = client.chat.complete(
-        model=MODEL_AGENT,
+    response = complete_mistral_chat(
+        api_key=api_key,
+        model_name=model_name,
         messages=mistral_messages,
         temperature=0.3,
         max_tokens=1000,
@@ -280,17 +328,20 @@ def generate_agent_response(question: str, messages: list[dict], available_tools
 
 __all__ = [
     'get_mistral_client',
+    'complete_mistral_chat',
     'MODEL_CLASSIFY',
     'MODEL_AGENT',
     'classify_with_llm',
     'generate_agent_response',
+    'evaluate_answer_consistency',
 ]
 
 
-def synthesize_from_evidence(draft: str) -> str:
+def synthesize_from_evidence(draft: str, *, api_key: str | None = None, model_name: str | None = None) -> str:
     """Use Mistral Large to phrase a fully cited, locally grounded draft."""
-    response = get_mistral_client().chat.complete(
-        model=MODEL_AGENT,
+    response = complete_mistral_chat(
+        api_key=api_key,
+        model_name=model_name,
         messages=[
             {"role": "system", "content": (
                 "You edit a Northwind graph answer. Preserve every citation marker exactly. "

@@ -46,6 +46,8 @@ def get_tools_dict():
 def run_graph_on_question(question, graph):
     return graph.invoke({
         "question": question, "route": "", "messages": [], "trace": [],
+        "draft_answer": None, "draft_citations": [],
+        "consistency_status": "pending", "consistency_feedback": None,
         "answer": "", "citations": [], "confidence": 0.0,
         "confidence_rationale": "", "loop_count": 0, "error": None,
     })

@@ -6,12 +6,15 @@ import streamlit as st
 
 
 def render_trace_drawer(state: dict[str, Any] | None) -> None:
-    """Render the route, tool records, confidence, and rationale from one run."""
-    with st.expander("Trace", expanded=False):
-        if state is None:
+    """Render trace and confidence in separate expandable subwindows."""
+    if state is None:
+        with st.expander("Trace", expanded=False):
             st.caption("Submit a question to see its route and execution trace.")
-            return
+        with st.expander("Confidence", expanded=False):
+            st.caption("Confidence details will appear after a question is answered.")
+        return
 
+    with st.expander("Trace", expanded=False):
         route = state.get("route") or "unknown"
         st.markdown(f"**Route:** `{route}`")
 
@@ -44,6 +47,7 @@ def render_trace_drawer(state: dict[str, Any] | None) -> None:
                     st.code(str(cypher), language="cypher")
                 st.divider()
 
+    with st.expander("Confidence", expanded=False):
         confidence = state.get("confidence", 0.0)
         try:
             confidence_label = f"{float(confidence):.2f}"

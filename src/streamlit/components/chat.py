@@ -23,7 +23,8 @@ def _render_history(history: list[dict]) -> None:
 def render_chat_panel() -> None:
     """Render session history and run a fresh graph for a submitted prompt."""
     history = st.session_state.setdefault(CHAT_HISTORY_KEY, [])
-    _render_history(history)
+    with st.container(height=450, border=True, key="chat_history_scroll", autoscroll=True):
+        _render_history(history)
 
     question = st.chat_input("Ask a question about the Northwind graph")
     if not question:

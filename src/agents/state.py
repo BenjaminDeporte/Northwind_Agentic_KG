@@ -72,13 +72,17 @@ class AgentState(TypedDict):
     
     Control-flow invariants:
     - MAX_STEPS = 8
-    - Budget exhaustion (loop_count >= MAX_STEPS) always routes to degrade, never to synthesize
+    - Budget exhaustion (loop_count >= MAX_STEPS) always routes to degrade, never to synthesis/checking
     - Every executed tool call appends exactly one ToolCallRecord to trace
     """
     question: str
     route: str                      # "agent" | "chitchat" | "refusal" | "degrade"
     messages: Annotated[list, add_messages]  # ONLY field with a reducer
     trace: list[ToolCallRecord]
+    draft_answer: Optional[str]
+    draft_citations: list[Citation]
+    consistency_status: str       # "pending" | "pass" | "revise"
+    consistency_feedback: Optional[str]
     answer: str
     citations: list[Citation]
     confidence: float

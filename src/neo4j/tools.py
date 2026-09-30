@@ -114,78 +114,94 @@ def _lookup_name_expression(label: str) -> str:
     return f"n.{LABEL_TO_NAME[label]}"
 
 
+def _lookup_match(node, node_label: str, tier: str) -> dict:
+    props = {key: _json_safe(value) for key, value in dict(node).items()}
+    key_prop = LABEL_TO_KEY[node_label]
+    if node_label == "Employee":
+        name = " ".join(filter(None, [props.get("firstName"), props.get("lastName")]))
+    elif node_label == "Order":
+        name = str(props.get("orderID", ""))
+    else:
+        name = str(props.get(LABEL_TO_NAME[node_label]) or props.get(key_prop, ""))
+    remaining = {k: v for k, v in props.items() if k not in {key_prop, LABEL_TO_NAME.get(node_label)}}
+    canonical = {
+        "label": node_label,
+        "key": str(props.get(key_prop, "")),
+        "name": name,
+        "properties": _filter_properties(remaining, node_label),
+    }
+    return {
+        "node": canonical,
+        "match": tier,
+        "evidence": {"nodes": [canonical], "edges": []},
+    }
+
+
 def lookup_entity(name: str, label: Optional[str] = None) -> dict:
     """Resolve a label-scoped key or name, or search names across all labels."""
-    if label is not None and label not in VALID_LABELS:
-        return {"status": "invalid", "query_name": name, "matches": []}
+    matches_payload = {"query_name": name, "matches": []}
+    if label is not None and (not isinstance(label, str) or label not in VALID_LABELS):
+        return {"status": "invalid", "error": f"Unsupported label: {label}", **matches_payload}
     if not isinstance(name, str) or not name.strip():
-        return {"status": "invalid", "query_name": name, "matches": []}
+        return {"status": "invalid", "error": "name must be a non-empty string", **matches_payload}
     labels = [label] if label else list(LABEL_TO_KEY)
 
-    def payload(node, node_label, tier):
-        props = dict(node)
-        key_prop = LABEL_TO_KEY[node_label]
-        if node_label == "Employee":
-            display_name = " ".join(filter(None, [props.get("firstName"), props.get("lastName")]))
-        elif node_label == "Order":
-            display_name = str(props.get("orderID", ""))
-        else:
-            display_name = str(props.get(LABEL_TO_NAME[node_label], ""))
-        remaining = {k: v for k, v in props.items() if k not in {key_prop, LABEL_TO_NAME.get(node_label)}}
-        return {"label": node_label, "key": str(props.get(key_prop, "")), "name": display_name,
-                "match": tier, "properties": _filter_properties(remaining, node_label)}
+    def run(query, parameters):
+        return client.run_read_query(query, parameters)[0]
 
-    # Preserve the exact display-name tier as the highest-priority name match.
     found = []
     for node_label in labels:
         expression = _lookup_name_expression(node_label)
-        query = f"MATCH (n:{node_label}) WHERE {expression} = $name RETURN n"
         try:
-            rows, _ = client.run_read_query(query, {"name": name})
-        except Exception:
-            return {"status": "invalid", "query_name": name, "matches": []}
-        found.extend(payload(row["n"], node_label, "exact") for row in rows)
+            rows = run(f"MATCH (n:{node_label}) WHERE {expression} = $name RETURN n", {"name": name})
+        except Exception as exc:
+            return {"status": "invalid", "error": f"Entity lookup failed: {exc}", **matches_payload}
+        found.extend(_lookup_match(row["n"], node_label, "exact") for row in rows)
     if found:
-        return {"status": "ok", "query_name": name, "matches": found[:10]}
+        return {"status": "ok", "error": None, **{**matches_payload, "matches": found[:10]}}
 
-    # A supplied label makes an exact canonical-key lookup unambiguous. toString
-    # supports Northwind key properties stored as either strings or integers.
+    # A supplied label makes an exact canonical-key lookup unambiguous.
     if label is not None:
         key_property = LABEL_TO_KEY[label]
-        query = f"MATCH (n:{label}) WHERE toString(n.{key_property}) = $name RETURN n"
         try:
-            rows, _ = client.run_read_query(query, {"name": name})
-        except Exception:
-            return {"status": "invalid", "query_name": name, "matches": []}
+            rows = run(
+                f"MATCH (n:{label}) WHERE toString(n.{key_property}) = $name RETURN n",
+                {"name": name},
+            )
+        except Exception as exc:
+            return {"status": "invalid", "error": f"Entity key lookup failed: {exc}", **matches_payload}
         if rows:
-            matches = [payload(row["n"], label, "exact") for row in rows]
-            return {"status": "ok", "query_name": name, "matches": matches[:10]}
+            matches = [_lookup_match(row["n"], label, "exact") for row in rows[:10]]
+            return {"status": "ok", "error": None, **{**matches_payload, "matches": matches}}
 
+    found = []
     for node_label in labels:
         expression = _lookup_name_expression(node_label)
-        query = f"MATCH (n:{node_label}) WHERE toLower({expression}) CONTAINS toLower($name) RETURN n"
         try:
-            rows, _ = client.run_read_query(query, {"name": name})
-        except Exception:
-            return {"status": "invalid", "query_name": name, "matches": []}
-        found.extend(payload(row["n"], node_label, "contains") for row in rows)
+            rows = run(
+                f"MATCH (n:{node_label}) WHERE toLower({expression}) CONTAINS toLower($name) RETURN n",
+                {"name": name},
+            )
+        except Exception as exc:
+            return {"status": "invalid", "error": f"Entity name search failed: {exc}", **matches_payload}
+        found.extend(_lookup_match(row["n"], node_label, "contains") for row in rows)
     if found:
-        return {"status": "ok", "query_name": name, "matches": found[:10]}
+        return {"status": "ok", "error": None, **{**matches_payload, "matches": found[:10]}}
 
     fuzzy = []
     for node_label in labels:
         try:
-            rows, _ = client.run_read_query(f"MATCH (n:{node_label}) RETURN n")
-        except Exception:
-            return {"status": "invalid", "query_name": name, "matches": []}
+            rows = run(f"MATCH (n:{node_label}) RETURN n", {})
+        except Exception as exc:
+            return {"status": "invalid", "error": f"Entity fuzzy search failed: {exc}", **matches_payload}
         for row in rows:
-            match = payload(row["n"], node_label, "fuzzy")
-            distance = _levenshtein(name.lower(), match["name"].lower())
+            match = _lookup_match(row["n"], node_label, "fuzzy")
+            distance = _levenshtein(name.lower(), match["node"]["name"].lower())
             if distance <= 1:
                 fuzzy.append((distance, match))
-    fuzzy.sort(key=lambda item: (item[0], item[1]["name"], item[1]["label"]))
+    fuzzy.sort(key=lambda item: (item[0], item[1]["node"]["name"], item[1]["node"]["label"]))
     matches = [match for _, match in fuzzy[:10]]
-    return {"status": "ok" if matches else "empty", "query_name": name, "matches": matches}
+    return {"status": "ok" if matches else "empty", "error": None, **{**matches_payload, "matches": matches}}
 
 
 # =============================================================================
@@ -193,7 +209,7 @@ def lookup_entity(name: str, label: Optional[str] = None) -> dict:
 # =============================================================================
 
 def _node_payload(node, label: str) -> dict:
-    props = dict(node)
+    props = {key: _json_safe(value) for key, value in dict(node).items()}
     key = str(props[LABEL_TO_KEY[label]])
     if label == "Employee":
         name = " ".join(filter(None, [props.get("firstName"), props.get("lastName")]))
@@ -212,22 +228,50 @@ def _node_payload(node, label: str) -> dict:
     return {"label": label, "key": key, "name": name, "properties": props}
 
 
+def _impact_result(status: str, anchor: dict | None, subgraph: dict, aggregates: dict, error: str | None = None) -> dict:
+    """Build the common impact envelope with a bounded claim evidence sample."""
+    all_nodes = subgraph.get("nodes", [])
+    selected_nodes = []
+    if anchor is not None:
+        selected_nodes.append(anchor)
+    for node in all_nodes:
+        if node is not None and (anchor is None or (node["label"], node["key"]) != (anchor["label"], anchor["key"])):
+            selected_nodes.append(node)
+            if len(selected_nodes) == 3:
+                break
+    selected_ids = {(node["label"], node["key"]) for node in selected_nodes}
+    selected_edges = [
+        {**edge, "properties": edge.get("properties", {})}
+        for edge in subgraph.get("edges", [])
+        if (edge["from"]["label"], edge["from"]["key"]) in selected_ids
+        and (edge["to"]["label"], edge["to"]["key"]) in selected_ids
+    ][:2]
+    return {
+        "status": status,
+        "error": error,
+        "anchor": anchor,
+        "subgraph": subgraph,
+        "aggregates": aggregates,
+        "evidence": {"nodes": selected_nodes, "edges": selected_edges},
+    }
+
+
 def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", depth: int = 3) -> dict:
     """Return the actual evidence graph and revenue aggregates for an anchor."""
     blank = {"nodes": [], "edges": []}
     zero = {"products_affected": 0, "orders_affected": 0, "revenue_at_risk": 0.0, "unusable_lines": 0}
-    if entity_label not in {"Supplier", "Product", "Customer"} or direction not in {"out", "in"} or type(depth) is not int or not 1 <= depth <= 3:
-        return {"status": "invalid", "anchor": None, "subgraph": blank, "aggregates": zero}
+    if not isinstance(entity_label, str) or entity_label not in {"Supplier", "Product", "Customer"} or direction not in {"out", "in"} or type(depth) is not int or not 1 <= depth <= 3 or not isinstance(entity_key, str) or not entity_key.strip():
+        return _impact_result("invalid", None, blank, zero, "Invalid label, direction, or depth")
     key_property = LABEL_TO_KEY[entity_label]
     anchor_query = f"MATCH (a:{entity_label} {{{key_property}: $key}}) RETURN a"
     try:
         anchors, _ = client.run_read_query(anchor_query, {"key": entity_key})
         if not anchors:
-            return {"status": "empty", "anchor": None, "subgraph": blank, "aggregates": zero}
+            return _impact_result("empty", None, blank, zero)
         anchor = _node_payload(anchors[0]["a"], entity_label)
         if direction == "in":
             if entity_label != "Product":
-                return {"status": "empty", "anchor": anchor, "subgraph": {"nodes": [anchor], "edges": []}, "aggregates": zero}
+                return _impact_result("empty", anchor, {"nodes": [anchor], "edges": []}, zero)
             rows, _ = client.run_read_query("""
                 MATCH (p:Product {productID: $key})
                 OPTIONAL MATCH (s:Supplier)-[:SUPPLIES]->(p)
@@ -247,7 +291,7 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                     nodes[("Supplier", supplier["key"])] = supplier
                     edges[("SUPPLIES", supplier["key"], anchor["key"])] = {
                         "type": "SUPPLIES", "from": {"label": "Supplier", "key": supplier["key"]},
-                        "to": {"label": "Product", "key": anchor["key"]},
+                        "to": {"label": "Product", "key": anchor["key"]}, "properties": {},
                     }
                 if order_node is not None:
                     order = _node_payload(order_node, "Order")
@@ -255,7 +299,7 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                     nodes[("Order", order["key"])] = order
                     edges[("ORDERS", order["key"], anchor["key"])] = {
                         "type": "ORDERS", "from": {"label": "Order", "key": order["key"]},
-                        "to": {"label": "Product", "key": anchor["key"]},
+                        "to": {"label": "Product", "key": anchor["key"]}, "properties": {},
                     }
                     if line is not None:
                         quantity = dict(line).get("quantity")
@@ -271,13 +315,12 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                     nodes[("Customer", customer["key"])] = customer
                     edges[("PURCHASED", customer["key"], order["key"])] = {
                         "type": "PURCHASED", "from": {"label": "Customer", "key": customer["key"]},
-                        "to": {"label": "Order", "key": order["key"]},
+                        "to": {"label": "Order", "key": order["key"]}, "properties": {},
                     }
             aggregates = {"products_affected": 1, "orders_affected": len(orders),
                           "revenue_at_risk": round(revenue, 2), "unusable_lines": unusable}
-            return {"status": "ok" if edges else "empty", "anchor": anchor,
-                    "subgraph": {"nodes": list(nodes.values()), "edges": list(edges.values())},
-                    "aggregates": aggregates}
+            subgraph = {"nodes": list(nodes.values()), "edges": list(edges.values())}
+            return _impact_result("ok" if edges else "empty", anchor, subgraph, aggregates)
         if entity_label == "Supplier":
             query = """
                 MATCH (s:Supplier {supplierID: $key})
@@ -301,8 +344,8 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
                 RETURN p, o, c, line
             """
         rows, _ = client.run_read_query(query, {"key": entity_key})
-    except Exception:
-        return {"status": "invalid", "anchor": None, "subgraph": blank, "aggregates": zero}
+    except Exception as exc:
+        return _impact_result("invalid", None, blank, zero, f"Impact query failed: {exc}")
 
     nodes = {(anchor["label"], anchor["key"]): anchor}
     edges = {}
@@ -315,7 +358,7 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
         return payload
     def add_edge(kind, start, end):
         signature = (kind, start["label"], start["key"], end["label"], end["key"])
-        edges[signature] = {"type": kind, "from": {"label": start["label"], "key": start["key"]}, "to": {"label": end["label"], "key": end["key"]}}
+        edges[signature] = {"type": kind, "from": {"label": start["label"], "key": start["key"]}, "to": {"label": end["label"], "key": end["key"]}, "properties": {}}
 
     for row in rows:
         p_node, o_node, c_node, line = (row.get(k) for k in ("p", "o", "c", "line"))
@@ -362,7 +405,8 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
             else:
                 revenue += float(price) * float(quantity)
     aggregates = {"products_affected": len(products), "orders_affected": len(orders), "revenue_at_risk": round(revenue, 2), "unusable_lines": unusable}
-    return {"status": "ok" if edges else "empty", "anchor": anchor, "subgraph": {"nodes": list(nodes.values()), "edges": list(edges.values())}, "aggregates": aggregates}
+    subgraph = {"nodes": list(nodes.values()), "edges": list(edges.values())}
+    return _impact_result("ok" if edges else "empty", anchor, subgraph, aggregates)
 
 
 # =============================================================================
@@ -370,59 +414,44 @@ def impact_analysis(entity_key: str, entity_label: str, direction: str = "out", 
 # =============================================================================
 
 def co_purchase(product_key: str) -> dict:
-    """
-    Given a product, the products sharing orders with it, ranked by co-occurrence.
-    
-    Signature: co_purchase(product_key: str) -> dict
-    Mode: curated
-    Statuses: ok | empty | invalid
-    
-    Counts distinct shared orders. Excludes the anchor product. Capped at 10.
-    Tie-break: ascending productID (deterministic).
-    """
-    query = """
-    MATCH (p1:Product {productID: $product_key})<-[line1:ORDERS]-(o:Order)-[line2:ORDERS]->(p2:Product)
-    WHERE p1 <> p2
-    RETURN 
-        p2.productID AS key,
-        p2.productName AS name,
-        count(DISTINCT o.orderID) AS co_bought
-    ORDER BY co_bought DESC, p2.productID ASC
-    LIMIT 10
-    """
-    
+    """Return ranked products co-occurring with the anchor in distinct orders."""
+    empty = {"product": None, "recommendations": []}
+    if not isinstance(product_key, str) or not product_key.strip():
+        return {"status": "invalid", "error": "product_key must be a non-empty string", **empty}
     try:
+        anchor_rows, _ = client.run_read_query(
+            "MATCH (p:Product {productID: $product_key}) RETURN p",
+            {"product_key": product_key},
+        )
+        if not anchor_rows:
+            return {"status": "empty", "error": None, **empty}
+        anchor_node = _node_payload(anchor_rows[0]["p"], "Product")
+        anchor = {field: anchor_node[field] for field in ("label", "key", "name")}
+        query = """
+            MATCH (p1:Product {productID: $product_key})<-[line1:ORDERS]-(o:Order)-[line2:ORDERS]->(p2:Product)
+            WHERE p1 <> p2
+            RETURN p2, count(DISTINCT o.orderID) AS co_bought
+            ORDER BY co_bought DESC, p2.productID ASC
+            LIMIT 10
+        """
         records, _ = client.run_read_query(query, {"product_key": product_key})
-        
-        if not records:
-            return {"status": "empty", "product": None, "recommendations": []}
-        
-        # Get anchor product
-        anchor_query = "MATCH (p:Product {productID: $product_key}) RETURN p.productID AS key, p.productName AS name"
-        anchor_records, _ = client.run_read_query(anchor_query, {"product_key": product_key})
-        anchor = {
-            "label": "Product",
-            "key": str(anchor_records[0]["key"]) if anchor_records else product_key,
-            "name": str(anchor_records[0]["name"]) if anchor_records else ""
-        }
-        
         recommendations = []
         for record in records:
+            node = _node_payload(record["p2"], "Product")
+            item = {field: node[field] for field in ("label", "key", "name")}
             recommendations.append({
-                "label": "Product",
-                "key": str(record["key"]),
-                "name": str(record["name"]),
-                "co_bought": int(record["co_bought"])
+                "product": item,
+                "co_bought": int(record["co_bought"]),
+                "evidence": {"nodes": [anchor_node, node], "edges": []},
             })
-        
         return {
-            "status": "ok",
+            "status": "ok" if recommendations else "empty",
+            "error": None,
             "product": anchor,
-            "recommendations": recommendations
+            "recommendations": recommendations,
         }
-        
-    except Exception as e:
-        return {"status": "invalid", "product": None, "recommendations": []}
+    except Exception as exc:
+        return {"status": "invalid", "error": f"Co-purchase query failed: {exc}", **empty}
 
 
 # =============================================================================
@@ -430,63 +459,56 @@ def co_purchase(product_key: str) -> dict:
 # =============================================================================
 
 def customer_history(customer_key: str) -> dict:
+    """Return a customer's dated order history with per-order totals and evidence."""
+    empty = {"customer": None, "orders": []}
+    if not isinstance(customer_key, str) or not customer_key.strip():
+        return {"status": "invalid", "error": "customer_key must be a non-empty string", **empty}
+
+    query = """
+        MATCH (c:Customer {customerID: $customer_key})
+        OPTIONAL MATCH (c)-[purchase:PURCHASED]->(o:Order)
+        OPTIONAL MATCH (o)-[line:ORDERS]->(p:Product)
+        WITH c, purchase, o, sum(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS total
+        RETURN c, purchase, o, o.orderDate AS order_date, total, o.shipCountry AS ship_country
+        ORDER BY order_date ASC
     """
-    A customer's orders as a dated flow with per-order totals.
-    
-    Signature: customer_history(customer_key: str) -> dict
-    Mode: curated
-    Statuses: ok | empty | invalid
-    
-    Per-order totals use revenue rule: coalesce(line.unitPrice, p.unitPrice) * line.quantity
-    Dates returned as raw strings: "1997-08-25 00:00:00.000" (milliseconds included).
-    Sorted by order_date ascending.
-    """
-    c_key_prop = LABEL_TO_KEY["Customer"]
-    o_key_prop = LABEL_TO_KEY["Order"]
-    
-    query = f"""
-    MATCH (c:Customer {{{c_key_prop}: $customer_key}})-[:PURCHASED]->(o:Order)-[line:ORDERS]->(p:Product)
-    RETURN 
-        o.{o_key_prop} AS order_key,
-        o.orderDate AS order_date,
-        sum(coalesce(line.unitPrice, p.unitPrice) * line.quantity) AS total,
-        o.shipCountry AS ship_country
-    ORDER BY o.orderDate ASC
-    """
-    
     try:
         records, _ = client.run_read_query(query, {"customer_key": customer_key})
-        
         if not records:
-            return {"status": "empty", "customer": None, "orders": []}
-        
-        # Get customer details
-        customer_query = f"MATCH (c:Customer {{{c_key_prop}: $customer_key}}) RETURN c.{c_key_prop} AS key, c.companyName AS name, c.country AS country"
-        customer_records, _ = client.run_read_query(customer_query, {"customer_key": customer_key})
-        customer = {
-            "label": "Customer",
-            "key": str(customer_records[0]["key"]) if customer_records else customer_key,
-            "name": str(customer_records[0]["name"]) if customer_records else "",
-            "country": str(customer_records[0]["country"]) if customer_records else ""
-        }
-        
+            return {"status": "empty", "error": None, **empty}
+
+        customer_node = _node_payload(records[0]["c"], "Customer")
+        customer = {field: customer_node[field] for field in ("label", "key", "name")}
         orders = []
         for record in records:
+            order_value = record.get("o")
+            if order_value is None:
+                continue
+            order_node = _node_payload(order_value, "Order")
+            order_ref = {field: order_node[field] for field in ("label", "key", "name")}
+            relationship = record.get("purchase")
+            relationship_properties = _json_safe(dict(relationship)) if relationship is not None else {}
+            edge = {
+                "type": "PURCHASED",
+                "from": {"label": "Customer", "key": customer_node["key"]},
+                "to": {"label": "Order", "key": order_node["key"]},
+                "properties": relationship_properties,
+            }
             orders.append({
-                "order_key": str(record["order_key"]),
-                "order_date": str(record["order_date"]),
-                "total": round(float(record["total"]), 2) if record["total"] is not None else 0.0,
-                "ship_country": str(record["ship_country"])
+                "order": order_ref,
+                "order_date": _json_safe(record.get("order_date")),
+                "total": round(float(record["total"]), 2) if record.get("total") is not None else 0.0,
+                "ship_country": _json_safe(record.get("ship_country")),
+                "evidence": {"nodes": [customer_node, order_node], "edges": [edge]},
             })
-        
         return {
-            "status": "ok",
+            "status": "ok" if orders else "empty",
+            "error": None,
             "customer": customer,
-            "orders": orders
+            "orders": orders,
         }
-        
-    except Exception as e:
-        return {"status": "invalid", "customer": None, "orders": []}
+    except Exception as exc:
+        return {"status": "invalid", "error": f"Customer history query failed: {exc}", **empty}
 
 
 # =============================================================================
@@ -552,13 +574,14 @@ def _aggregate_filter_value(label: str, prop: str, value: str):
 
 
 def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = None) -> dict:
-    """Run a fixed, parameterized aggregate with contributor node handles."""
-    invalid = {"status": "invalid", "groups": [], "n_groups": 0}
-    if label not in AGGREGATE_PROPERTIES or metric not in {"count", "sum_revenue", "avg_revenue"}:
-        return invalid
+    """Run a fixed, parameterized grouped metric with bounded representative evidence."""
+    if not isinstance(label, str) or label not in AGGREGATE_PROPERTIES:
+        return {"status": "invalid", "error": f"Unsupported label: {label}", "groups": [], "n_groups": 0}
+    if not isinstance(metric, str) or metric not in {"count", "sum_revenue", "avg_revenue"}:
+        return {"status": "invalid", "error": f"Unsupported aggregate metric: {metric}", "groups": [], "n_groups": 0}
     whitelist = AGGREGATE_PROPERTIES[label]
-    if group_by not in whitelist:
-        return invalid
+    if not isinstance(group_by, str) or group_by not in whitelist:
+        return {"status": "invalid", "error": f"Unsupported group_by property for {label}: {group_by}", "groups": [], "n_groups": 0}
     alias = AGGREGATE_ALIASES[label]
     if metric == "count":
         match_clause, value_expr = COUNT_PATHS[label]
@@ -569,15 +592,15 @@ def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = Non
     filter_prop = None
     parameters = {}
     if where is not None:
-        if "=" not in where:
-            return invalid
+        if not isinstance(where, str) or "=" not in where:
+            return {"status": "invalid", "error": "where must be a whitelisted equality filter", "groups": [], "n_groups": 0}
         filter_prop, raw_value = (part.strip() for part in where.split("=", 1))
         if filter_prop not in whitelist:
-            return invalid
+            return {"status": "invalid", "error": f"Unsupported filter property for {label}: {filter_prop}", "groups": [], "n_groups": 0}
         try:
             parameters["where_value"] = _aggregate_filter_value(label, filter_prop, raw_value)
-        except ValueError:
-            return invalid
+        except ValueError as exc:
+            return {"status": "invalid", "error": str(exc), "groups": [], "n_groups": 0}
     if label == "Product" and metric != "count" and (group_by == "categoryID" or filter_prop == "categoryID"):
         match_clause += " MATCH (p)-[:PART_OF]->(c:Category)"
     group_alias = "c" if label == "Product" and group_by == "categoryID" else alias
@@ -589,7 +612,7 @@ def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = Non
     order_by = "metric_value DESC" if metric != "count" else "group_value ASC"
     query = (
         f"{match_clause} RETURN {group_alias}.{group_by} AS group_value, "
-        f"{value_expr} AS metric_value, collect(DISTINCT {alias}) AS evidence_nodes "
+        f"{value_expr} AS metric_value, collect(DISTINCT {alias})[0..3] AS evidence_nodes "
         f"ORDER BY {order_by} LIMIT 20"
     )
     try:
@@ -597,20 +620,18 @@ def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = Non
         groups = []
         for record in records:
             handles = {}
-            for node in record.get("evidence_nodes", []):
+            for node in record.get("evidence_nodes", [])[:3]:
                 payload = _node_payload(node, label)
-                handles[(payload["label"], payload["key"])] = {
-                    field: payload[field] for field in ("label", "key", "name")
-                }
+                handles[(payload["label"], payload["key"])] = payload
             raw_metric = record["metric_value"]
             groups.append({
                 "group_value": str(record["group_value"]),
                 "metric_value": int(raw_metric) if metric == "count" else round(float(raw_metric), 2),
-                "evidence": list(handles.values()),
+                "evidence": {"nodes": list(handles.values()), "edges": []},
             })
-        return {"status": "ok" if groups else "empty", "groups": groups, "n_groups": len(groups)}
-    except Exception:
-        return invalid
+        return {"status": "ok" if groups else "empty", "error": None, "groups": groups, "n_groups": len(groups)}
+    except Exception as exc:
+        return {"status": "invalid", "error": f"Aggregate query failed: {exc}", "groups": [], "n_groups": 0}
 
 
 # =============================================================================
@@ -619,7 +640,7 @@ def aggregate(label: str, group_by: str, metric: str, where: Optional[str] = Non
 
 def _repair_cypher(query: str, error: str) -> str:
     """Ask the large model for one corrected read query using the schema contract."""
-    from src.agents.llm import get_mistral_client, MODEL_AGENT
+    from src.agents.llm import complete_mistral_chat, MODEL_AGENT
     from src.agents.schema_prompt import generate_schema_prompt
 
     prompt = (
@@ -629,8 +650,8 @@ def _repair_cypher(query: str, error: str) -> str:
         f"Schema:\n{generate_schema_prompt()}\n\n"
         f"Failed query:\n{query}\n\nError:\n{error}"
     )
-    response = get_mistral_client().chat.complete(
-        model=MODEL_AGENT,
+    response = complete_mistral_chat(
+        model_name=MODEL_AGENT,
         messages=[{"role": "user", "content": prompt}],
         temperature=0.0,
         max_tokens=700,
@@ -773,6 +794,11 @@ def _validate_schema_cypher(query: str) -> str | None:
 def run_readonly_cypher(query: str) -> dict:
     """Validate, run, and at most once repair a read-only Cypher query."""
     attempts = []
+    if not isinstance(query, str) or not query.strip():
+        invalid_query = query if isinstance(query, str) else str(query)
+        error = "query must be a non-empty string"
+        attempts.append({"cypher": invalid_query, "valid": False, "error": error})
+        return {"status": "invalid", "query": invalid_query, "attempts": attempts, "rows": [], "error": error}
     if not client._validate_read_only(query):
         error = "Only one read-only query is allowed"
         attempts.append({"cypher": query, "valid": False, "error": error})

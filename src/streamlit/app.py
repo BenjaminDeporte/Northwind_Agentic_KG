@@ -24,14 +24,18 @@ st.set_page_config(
 st.title("Northwind Agentic Knowledge Graph")
 st.caption("Ask questions about the Northwind graph and inspect the supporting evidence.")
 
-chat_column, evidence_column = st.columns([3, 2], gap="large")
+chat_column, trace_column, evidence_column = st.columns([3, 2, 2], gap="medium")
 
 with chat_column:
     st.subheader("Chat")
     render_chat_panel()
 
-with evidence_column:
-    render_trace_drawer(st.session_state.get("last_run_state"))
+with trace_column:
+    st.subheader("Traceable Explainability")
+    with st.container(height=450, border=True, key="trace_panel_scroll"):
+        render_trace_drawer(st.session_state.get("last_run_state"))
 
-    st.subheader("Evidence graph")
-    st.info("The graph evidence for an answer will appear here.")
+with evidence_column:
+    st.subheader("Evidence Graph")
+    with st.container(height=450, border=True, key="evidence_graph_scroll"):
+        st.info("The graph evidence for an answer will appear here.")
