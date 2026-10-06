@@ -158,102 +158,10 @@ Fixed count synthesis so a scope anchor must be a node returned as its own value
 
 Live end-to-end validation (read-only Neo4j and Mistral; invoked the compiled graph directly without writing a run-log entry): **route `agent`, loop_count 1, one successful Cypher tool call, consistency `pass`**, answer: “The Northwind dataset contains 1,104 nodes. Representative evidence: [Territory:01581] [Territory:01730] [Territory:01833].” Full deterministic suite: `uv run pytest -q`: **232 passed**. Python compilation and `git diff --check` passed. Restart Streamlit to load the corrected graph before the next browser retest.
 
+## Customer product-ranking correction (2026-09-30 16:28 CEST, Europe/Paris)
 
-## Redesign foundation — Phase 0.1 to 0.3 (2026-10-06 14:35 CEST, Europe/Paris)
+The live question “Which customer ordered the most products?” produced a valid query and evidence but synthesis mislabeled it as “Most ordered product: Pavlova”; the result contained a Customer node, `total_quantity`, and representative Product nodes. Updated the active prompt to define “most products” as the count of distinct products per customer, while reserving summed quantity for explicit units/quantity/volume questions. Updated synthesis so a Customer plus quantity result is rendered as product units and cannot be mislabeled as a Product ranking. Added a deterministic synthesis regression. Live compiled-graph validation returned: “56 products for Ernst Handel [Customer:ERNSH]” with representative Product citations, one successful Cypher call, loop_count 1, consistency pass. Full suite: `uv run pytest -q`: **233 passed**. No run-log entry was written by the direct live validation.
 
-**0.1 — Archive current implementation: complete.** Created `archive/legacy/` as a recoverable snapshot of commit `93b766c`, including the prior source, tests, contracts, and documentation. Added `archive/legacy/ARCHIVE_MANIFEST.md` identifying the snapshot, date, purpose, and runtime boundary. The archive is reference-only; the redesigned runtime will not import from it.
+## Customer product-ranking correction (2026-09-30 16:28 CEST, Europe/Paris)
 
-**0.2 — Create new repository layout: complete.** Added the shared `common/` boundary and four architecture directories: `generic`, `generic_reflection`, `curated`, and `curated_reflection`. Added README placeholders documenting ownership and the future architecture-specific `PROJECT.md` contracts.
-
-**0.3 — Define common runtime boundary: complete.** Added boundary documentation for shared configuration, evaluation, MLflow, Neo4j, and schema/prompt projection. The documentation records the fixed conversational-model role, selectable Cypher-model role, configurable MLflow tracking URI, read-only Neo4j boundary, and separation between common services and architecture-specific graph state.
-
-Verification: archive contents were created from the committed implementation; new directories and boundary documents are present; the existing `PLAN.md` and source tree were not overwritten; no application code was changed. Item 0.4 (copying the canonical benchmark CSV) remains next.
-
-**Archive adjustment — ground-truth documents (2026-10-06 14:35 CEST, Europe/Paris).** Verified that all five root `GROUND_TRUTH*.md` files were byte-identical to the copies in `archive/legacy/`, then removed the active-root duplicates. Updated the archive manifest to list the preserved legacy ground-truth documents. The new benchmark artifact for the redesigned project remains a separate Phase 0.4 item.
-
-## Redesign foundation — Phase 0.4 (2026-10-06 14:42 CEST, Europe/Paris)
-
-**0.4 — Add canonical benchmark: complete.** Added `benchmark/northwind_questions.csv` with the 20 benchmark questions across the four agreed groups. Preserved the ground-truth answer column and the informational Cypher provenance in `Comment`; the Cypher is not treated as the generated answer or a scoring target. Added `benchmark/README.md` documenting the columns and evaluation boundary.
-
-Verification: the CSV contains exactly 20 question records, five per group, with multiline answers and Cypher comments quoted as valid CSV fields. The benchmark remains independent of all architecture directories. No model or Neo4j calls were made.
-
-## Architecture 1 contract — item 1.1 (2026-10-06 14:45 CEST, Europe/Paris)
-
-**1.1 — Architecture contract: complete.** Added `architectures/generic/PROJECT.md` for the first redesigned architecture: fixed conversational Mistral model, configurable Cypher-generation model, router, generic Text2Cypher tool, three-total-attempt Cypher validation loop, Neo4j execution, draft/final answer generation, and flat MLflow logging. The contract defines the minimal AgentState without the archived trace, citation, confidence, or rubric systems; it specifies node responsibilities, graph edges, function signatures, prompt/schema authority, failure behavior, non-goals, and acceptance criteria.
-
-Verification: contract references shared `SCHEMA.md` and `common/` boundaries, defines no curated tools or self-reflection for Architecture 1, and preserves the agreed three-attempt Cypher bound. No application code, model calls, or Neo4j calls were made. Next: user review of `architectures/generic/PROJECT.md` before item 1.2 implementation.
-
-**Architecture 1 contract amendments — item 1.1 clarification (2026-10-06).** Applied the agreed design decisions: Cypher validation failures are structured `ToolMessage` results consumed by the next Text2Cypher call; `generate_cypher` handles both initial generation and repair through optional `previous_query` and `validation_error` arguments; `generate_final_answer` was removed in favor of one `generate_answer` function; and Neo4j `EXPLAIN` is the non-executing preflight check before query execution. No implementation code changed. Item 1.2 remains blocked on user approval of the amended contract.
-
-## Architecture 1 foundation — items 1.2 to 1.5 (2026-10-06 15:19 CEST, Europe/Paris)
-
-**1.2 — LangGraph state: complete.** Added `architectures/generic/state.py` with the minimal `AgentState`, `Route` type, `add_messages` reducer, and explicit bounds for high-level agent turns and three total Cypher attempts. The state contains no archived trace, span, citation, confidence, or rubric fields.
-
-**1.3 — LangGraph topology: complete.** Added `architectures/generic/graph.py` and `nodes.py`. The graph implements router branching, agent entry, Text2Cypher, validation, Neo4j, answer generation, terminal handling, and the bounded invalid-query loop. Chitchat and refusal bypass graph access.
-
-**1.4 — Function and tool signatures: complete.** Added `architectures/generic/interfaces.py` with injected handler protocols for routing, combined initial/repair Cypher generation, validation, read-only execution, and one-step answer generation. Validation failures are carried as structured `ToolMessage` values with deterministic tool-call IDs.
-
-**1.5 — Foundation tests: complete.** Added `tests/test_generic_foundation.py` with deterministic fakes covering reducer metadata, interface signatures, valid execution, validation-error feedback into a rewrite, three-attempt termination, chitchat, and refusal. Verification: `uv run --no-sync pytest -q tests/test_generic_foundation.py -o addopts=` — **7 passed**. Python compilation and `git diff --check` passed. No live model or Neo4j calls were made. Next: user review of the implemented foundation before Phase 2.1.
-
-**Architecture 1 route-aware answer fix (2026-10-06).** Updated the `generate_answer` contract and handler protocol to receive the explicit router route. `answer_generation_node` now passes `state["route"]`, so chitchat, refusal, and agent behavior are selected intentionally rather than inferred from query-result presence. Updated the deterministic fake and contract documentation; no live services were used.
-
-## Architecture 1 — Phase 2.1 (2026-10-06 16:15 CEST, Europe/Paris)
-
-**2.1 — Schema prompt projection: complete.** Added `common/prompts/schema_prompt.py`, a mechanical projector that reads the repository-root `SCHEMA.md` and extracts node labels, keys, name properties, relationship directions, structural facts, traversal patterns, read-only rules, and the verified revenue rule. It exposes cached prompt generation plus component accessors for later tools. The projector accepts an explicit schema path for deterministic tests and has no hand-maintained graph facts.
-
-Added `tests/test_generic_schema_prompt.py` covering all nine labels, all nine relationships, the corrected `PURCHASED` direction, traversal patterns, the revenue rule, prompt content, caching, and a temporary-schema proof that the output is not hardcoded. Verification: `uv run --no-sync pytest -q tests/test_generic_schema_prompt.py -o addopts=` — **5 passed**; Python compilation and `git diff --check` passed. No model or Neo4j calls were made. Next: Phase 2.2, the generic Text2Cypher tool.
-
-**Phase 2.1 prompt corrections (2026-10-06 16:29 CEST, Europe/Paris).** Updated the projector to parse relationship properties whose type annotations contain commas, so `ORDERS` now renders `quantity`, `unitPrice`, and `discount` correctly. Updated `SCHEMA.md` to state the agreed three-total-attempt Cypher bound instead of the stale one-retry rule. Architecture 1 now omits the impact-analysis traversal example by default; a named option can include it for a later architecture. Verification: `uv run --no-sync pytest -q tests/test_generic_schema_prompt.py -o addopts=` — **6 passed**; generated-prompt assertions confirmed the impact example is absent by default, the relationship properties are clean, and the three-attempt rule is present. No model or Neo4j calls were made.
-
-## Architecture 1 — Phase 2.2 (2026-10-06)
-
-**2.2 — Generic Text2Cypher tool: complete.** Added `architectures/generic/text2cypher.py` with an injected provider-neutral chat client and per-call `model_name` selection. Initial generation and validation-error repair share one `generate_cypher` function; repair prompts include the previous query and validator error. The tool accepts the generated query as text, removes common Markdown code fences, and leaves syntax/read-only enforcement to Phase 2.3. Added the `Text2CypherTool` adapter matching the Architecture 1 handler shape.
-
-Added `tests/test_generic_text2cypher.py` covering selected-model propagation, prompt context, rewrite context, repair-argument validation, Markdown cleanup, and empty model output. Verification: the focused Text2Cypher tests pass; no live model or Neo4j calls were made. Next: Phase 2.3, Cypher validation.
-
-## Architecture 1 — Phases 2.3 to 2.6 (2026-10-06)
-
-**2.3 — Cypher validation: complete.** Added `common/neo4j/validation.py`. The validator normalizes one terminal semicolon, rejects internal/multiple statements and write clauses, requires a read/yield result, checks labels and explicit properties against the supplied schema, and supports an injected Neo4j `EXPLAIN` callback. Validation returns structured data and does not raise for an invalid generated query.
-
-**2.4 — Bounded rewrite loop: complete.** Kept the three-total-attempt loop in the compiled graph and made the service boundary explicit: each validation result is wrapped by `validate_cypher_node` in a `ToolMessage`, and the next Text2Cypher call receives the failed query and error. The validator and executor contain no hidden retries, so a third failure terminates predictably.
-
-**2.5 — Neo4j execution: complete.** Added `common/neo4j/executor.py` with a `Neo4jTool` adapter and read-only execution through either the driver's `execute_query` API or a session factory. It executes only the normalized query and returns structured failed outcomes instead of leaking driver exceptions into graph state.
-
-**2.6 — Generic result envelope: complete.** Added `common/neo4j/results.py`. Every execution result contains `status`, `query`, `rows`, `evidence`, and nullable `error`; rows preserve scalars and nested JSON-safe nodes, relationships, paths, lists, and maps, while evidence is deduplicated. Empty successful results are distinguished from execution failures. Added `tests/test_generic_services.py` for validation, EXPLAIN injection, bounded execution outcomes, and representative result shapes.
-
-Verification: `uv run --no-sync pytest -q tests/test_generic_services.py tests/test_generic_foundation.py tests/test_generic_text2cypher.py -o addopts=` — **17 passed**; Python compilation and `git diff --check` passed. No live Neo4j or model calls were made. Next: Phase 3.1, draft answer generation and raw structured-output logging.
-
-## Architecture 1 — Phases 3.1 to 3.5 and A1 completion work (2026-10-06)
-
-**3.1 — Draft answer generation: complete.** Added `architectures/generic/conversation.py` with a provider-neutral conversational client, route prompt, answer prompt, JSON extraction, and plain-text fallback. The answer model receives the question, validated query, and generic result envelope. Its structured result is preserved when valid; malformed JSON remains visible as answer text with a null structured result.
-
-**3.2 — Accepted answer handoff: complete for Architecture 1.** The existing `answer_generation_node` intentionally writes both draft and accepted fields in one call. This is the baseline architecture's direct handoff; no second final-answer model call is introduced. Later architectures may insert review/reflection between those fields.
-
-**3.3 — Self-reflection boundary: complete for Architecture 1 as an explicit no-op.** No reflection node is added to the generic baseline, per its contract. The state and graph leave the shared loop counter available for Architecture 2, where reflection will be a separate architecture-specific node.
-
-**3.4 — No-feedback path: complete.** The compiled generic graph routes a successful validated result directly to answer generation and then terminal. Chitchat and refusal use explicit route-specific answer instructions and never access Neo4j.
-
-**3.5 — Architecture acceptance foundation: complete.** Added conversational adapter tests and retained the compiled-graph tests for valid execution, bounded repair, terminal failure, chitchat, and refusal. The generic architecture now has concrete provider-neutral Text2Cypher, validation, Neo4j, result-envelope, routing, and answer-generation services.
-
-**A1.1/A1.2 — Contract and implementation: complete.** The Architecture 1 contract and Phases 1–3 implementation are now represented in code and tests. Added `common/config/models.py` for selectable Cypher candidates and `common/evaluation/model_selection.py` for deterministic baseline selection from completed run results.
-
-**A1.3/A1.4 — Sweep support: implemented, live execution pending.** Candidate metadata and deterministic selection are ready, but the frontier/Neo4j model sweep and baseline decision require configured provider credentials, live model calls, Neo4j access, and MLflow tracking. No model was selected implicitly and no live calls were made in this session.
-
-Verification: `uv run --no-sync pytest -q -o addopts=''` — **264 passed**; Python compilation and `git diff --check` passed. No live model, Neo4j, or MLflow calls were made.
-
-## Plan amendment — shared Phase 4 (2026-10-06)
-
-Revised `PLAN_REDESIGN.md` Phase 4 from MLflow-only work to **Shared Runtime,
-Evaluation, and MLflow Integration**. It now contains eight independently
-verifiable items: shared settings, conversational and Cypher provider adapters,
-runtime factory, architecture registration, live smoke harness, MLflow run
-service, and an end-to-end runtime acceptance gate. Architecture 1 model sweep
-and baseline selection now explicitly depend on this shared runtime and the
-benchmark runner. The architecture-specific contracts remain responsible for
-their own state and graph topology.
-
-**Plan ordering correction (2026-10-06).** Moved the Phase 4 section so it is
-immediately after the common Phase 3 table and before Architecture 1–4. This is
-the actual dependency order: shared settings, provider adapters, runtime
-factory, smoke harness, and MLflow must exist before architecture-specific live
-runs or model sweeps.
+The live question “Which customer ordered the most products?” produced a valid query and evidence but synthesis mislabeled it as “Most ordered product: Pavlova”; the result contained a Customer node, `total_quantity`, and representative Product nodes. Updated the active prompt to define “most products” as the count of distinct products per customer, while reserving summed quantity for explicit units/quantity/volume questions. Updated synthesis so a Customer plus quantity result is rendered as product units and cannot be mislabeled as a Product ranking. Added a deterministic synthesis regression. Live compiled-graph validation returned: “56 products for Ernst Handel [Customer:ERNSH]” with representative Product citations, one successful Cypher call, loop_count 1, consistency pass. Full suite: `uv run pytest -q`: **233 passed**. No run-log entry was written by the direct live validation.

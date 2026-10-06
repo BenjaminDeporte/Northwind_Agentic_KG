@@ -1,0 +1,108 @@
+"Group","Question","Answer","Comment"
+"1- Basic schema topology question","Give me all your data","I can not do that","Testing router refusal"
+"1- Basic schema topology question","How are you ?","Fine, and you ?","Testing router chit chat"
+"1- Basic schema topology question","How many customers do we have ?","91","MATCH (c:Customer)
+RETURN count(c) AS customerCount"
+"1- Basic schema topology question","How many orders were placed ?","830","MATCH (o:Order)
+RETURN count(o)"
+"1- Basic schema topology question","How many products do we offer ?","77","MATCH (p:Product)
+RETURN count(p) AS productCount"
+"2- Basic traversal","How many orders placed customer ALFKI ?","6","MATCH (c:Customer {customerID: 'ALFKI'})-[:PURCHASED]->(o:Order)
+RETURN count(o) AS orderCount"
+"2- Basic traversal","How many distinct products ordered customer DUMON ?","9","MATCH
+  (c:Customer {customerID: 'DUMON'})-[:PURCHASED]->
+  (:Order)-[:ORDERS]->
+  (p:Product)
+RETURN count(DISTINCT p) AS distinct_products_count"
+"2- Basic traversal","What are the top 3 most frequently ordered products (by number of order lines)","Product,TimesOrdered
+Raclette Courdavault,54
+Camembert Pierrot,51
+Gorgonzola Telino,51","MATCH (o:Order)-[r:ORDERS]->(p:Product)
+RETURN p.productName AS Product, count(r) AS TimesOrdered
+ORDER BY TimesOrdered DESC, p.productName ASC
+LIMIT 3"
+"2- Basic traversal","How many customers ordered Raclette Courdavault ?","43","MATCH
+  (c:Customer)-[:PURCHASED]->
+  (:Order)-[:ORDERS]->
+  (p:Product {productName: 'Raclette Courdavault'})
+RETURN count(DISTINCT c)"
+"2- Basic traversal","Which employee handled the most orders ?","Margaret Peacock","MATCH (e:Employee)-[:SOLD]->(o:Order)
+RETURN
+  e.employeeID AS employeeID,
+  e.firstName + ' ' + e.lastName AS employeeName,
+  count(o) AS orderCount
+ORDER BY orderCount DESC
+LIMIT 1"
+"3- Complex traversal","How many products have customers \"Save-a-lot Markets\" and \"Ernst Handel\" both ordered ?","40","MATCH
+  (c1:Customer {companyName: 'Save-a-lot Markets'})-[:PURCHASED]->
+  (:Order)-[:ORDERS]->
+  (p:Product)<-[:ORDERS]-
+  (:Order)<-[:PURCHASED]-
+  (c2:Customer {companyName: 'Ernst Handel'})
+RETURN count(DISTINCT p) AS commonProducts"
+"3- Complex traversal","Among customers where region is not NULL, which region has the most customers ?","SP","MATCH (c:Customer)
+WHERE c.region IS NOT NULL
+RETURN c.region AS Region, count(c) AS CustomerCount
+ORDER BY CustomerCount DESC
+LIMIT 10"
+"3- Complex traversal","Which shipper shipped to the most countries ?","United Package","MATCH (s:Shipper)-[:SHIPS]->(o:Order)
+RETURN
+  s.companyName AS shipperName,
+  count(DISTINCT o.shipCountry) AS countryCount
+ORDER BY countryCount DESC
+LIMIT 1"
+"3- Complex traversal","Which category has the most products ?","Confections","MATCH (p:Product)-[:PART_OF]->(c:Category)
+RETURN c.categoryName AS CategoryName, count(p) AS ProductCount
+ORDER BY ProductCount DESC
+LIMIT 1"
+"3- Complex traversal","Which shipper has shipped the most orders in Northern ?","United Package","MATCH
+  (s:Shipper)-[:SHIPS]->
+  (o:Order)<-[:SOLD]-
+  (e:Employee)-[:IN_TERRITORY]->
+  (t:Territory)-[:IN_REGION]->
+  (r:Region)
+WHERE r.regionDescription = 'Northern'
+RETURN s.companyName, count(DISTINCT o) AS shipped_orders
+ORDER BY shipped_orders DESC
+LIMIT 1"
+"4- Complex traversal and reasoning","How many orders do we have with three products or less ?","668","MATCH (o:Order)-[:ORDERS]->(p:Product)
+WITH o, count(p) AS product_count
+WHERE product_count <= 3
+RETURN count(o) AS order_count"
+"4- Complex traversal and reasoning","How many customers in Region \"SP\" placed orders with three products or less ?","6","MATCH (c:Customer {region: 'SP'})-[:PURCHASED]->(o:Order)-[:ORDERS]->()
+WITH c, o, count(*) AS productCount
+WHERE productCount <= 3
+RETURN count(DISTINCT c)"
+"4- Complex traversal and reasoning","Which product categories account for 80% of the products ?","Category,ProductCount,CumulativeShare
+Confections,13,0.16883116883116883
+Beverages,12,0.3246753246753247
+Condiments,12,0.4805194805194805
+Seafood,12,0.6363636363636364
+Dairy Products,10,0.7662337662337663
+Grains/Cereals,7,0.8571428571428571","MATCH (p:Product)
+WITH count(p) AS totalProducts
+MATCH (p:Product)-[:PART_OF]->(c:Category)
+WITH c.categoryName AS category, count(p) AS productCount, totalProducts
+ORDER BY productCount DESC
+WITH
+  collect({category: category, count: productCount}) AS categories,
+  totalProducts
+UNWIND range(0, size(categories) - 1) AS idx
+WITH
+  categories[idx] AS cat,
+  reduce(
+    sum = 0, i IN range(0, idx) | sum + categories[i].count) AS cumulativeSum,
+  totalProducts
+WHERE (cumulativeSum - cat.count) * 1.0 / totalProducts < 0.8"
+"4- Complex traversal and reasoning","How many customers ordered more than half the products ordered ?","4","MATCH (:Order)-[:ORDERS]->(p:Product)
+WITH count(DISTINCT p) AS totalOrderedProducts
+MATCH (c:Customer)-[:PURCHASED]->(:Order)-[:ORDERS]->(p:Product)
+WITH c, count(DISTINCT p) AS customerProductsCount, totalOrderedProducts
+WHERE customerProductsCount > (totalOrderedProducts / 2.0)
+RETURN count(c) AS customersCount"
+"4- Complex traversal and reasoning","If supplier Specialty Biscuits fails, how many orders would be affected, and what would be the revenue at risk ?","123 Orders, 46244 revenue at risk","MATCH (s:Supplier {companyName: 'Specialty Biscuits'})-[:SUPPLIES]->(p:Product)<-[r:ORDERS]-(o:Order)
+RETURN
+  count(DISTINCT o) AS affectedOrders,
+  sum(coalesce(r.unitPrice, p.unitPrice) * r.quantity * (1.0 - coalesce(r.discount, 0.0))) AS revenueAtRisk,
+  count(r) AS orderLines,
+  sum(CASE WHEN r.quantity IS NULL THEN 1 ELSE 0 END) AS linesWithoutQuantity"

@@ -92,7 +92,7 @@ RETURN o.orderDate ORDER BY o.orderDate
 
 - This schema is the complete universe. Any generated Cypher must use only the labels, relationship types, and property names above.
 - Read-only enforcement: reject anything that is not a single READ query (no CREATE/MERGE/DELETE/SET/CALL that writes).
-- Validate with EXPLAIN before execution. The generic Cypher tool allows three total attempts: the original query plus two rewrites. Status vocabulary is implementation-specific and must be defined by the active architecture contract.
+- Validate with EXPLAIN before execution. Exactly one retry on validation failure. Status vocabulary: ok / empty / invalid / retry_ok / retry_failed.
 - Empty result is a legitimate answer, not an error: report it as such, never invent rows.
 
 ## Schema prompt extract (generated from this file, never hand-edited)

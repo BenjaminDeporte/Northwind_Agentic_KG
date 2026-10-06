@@ -88,9 +88,7 @@ Each item updates `SESSION_SUMMARY.md`.
 
 ## Architecture Build Sequence
 
-Phases 1–3 define the common architecture work sequence. Phase 4 then provides
-the shared runtime boundary before the architecture-specific builds and live
-model sweeps.
+Phases 1–3 are performed independently for each architecture.
 
 ### Phase 1 — Architecture Contract and LangGraph Foundation
 
@@ -123,31 +121,6 @@ model sweeps.
 | 3.4 | No-feedback path | When disabled, send the draft directly to final answer generation. | Confirm reflection is not invoked. |
 | 3.5 | Architecture acceptance | Run the 20-question benchmark through the architecture with mocked and live integrations as appropriate. | Approve before the next architecture. |
 
-## Phase 4 — Shared Runtime, Evaluation, and MLflow Integration
-
-Phase 4 owns the architecture-agnostic runtime boundary and comes before the
-architecture-specific implementations. It supplies configuration, provider
-adapters, runtime composition, and shared run/evaluation plumbing; each
-architecture still owns its state, graph topology, and handlers.
-
-MLflow runs beside Streamlit:
-
-```text
-Streamlit → http://localhost:8501
-MLflow    → http://localhost:5000
-```
-
-| # | Work Item | Description | Verification |
-|---|---|---|---|
-| 4.1 | Shared settings loader | Load Neo4j, fixed conversational-model, selectable Cypher-model, prompt, Streamlit, and MLflow settings from environment/configuration. Keep secrets out of architecture code. | Load a test configuration and inspect resolved values without contacting external services. |
-| 4.2 | Conversational provider adapter | Adapt the fixed conversational provider to the generic route and answer client protocols. Preserve model name, raw response, and structured-output parse errors. | Mock the provider and verify routing, answer generation, and malformed JSON handling. |
-| 4.3 | Cypher provider registry | Register frontier and Neo4j fine-tuned Cypher candidates behind the `ChatModelClient` protocol, with per-candidate model and API-key configuration. | Instantiate each configured adapter with a fake transport and verify model selection. |
-| 4.4 | Runtime factory contract | Define a factory that loads the schema prompt, creates clients/tools, composes architecture-specific handlers, and returns a compiled graph plus runtime metadata. | Review the factory signature and confirm no architecture state leaks across runs. |
-| 4.5 | Architecture registration | Register generic, generic-reflection, curated, and curated-reflection builders behind one selection interface. Unsupported names fail clearly. | Build the generic architecture from the registry with deterministic fake dependencies. |
-| 4.6 | Live smoke-test harness | Add a `uv run` script that submits one question to a selected architecture and prints answer, structured result, Cypher, validation, and Neo4j outcome. | Run against a configured Neo4j/model pair and retain the output for review. |
-| 4.7 | MLflow run service | Add configurable tracking URI, experiment/run metadata, flat configuration runs, and logging for prompts, models, Cypher attempts, results, answers, and raw structured output. | Start MLflow and inspect one completed run and its artifact. |
-| 4.8 | Runtime acceptance gate | Verify the factory, smoke harness, and MLflow service together for one architecture/model configuration before any sweep. | One live question completes end to end and is visible in MLflow; update `SESSION_SUMMARY.md`. |
-
 ## Architecture 1 — Generic Text2Cypher
 
 ```text
@@ -160,8 +133,8 @@ No self-reflection is included.
 |---|---|---|---|
 | A1.1 | Create contract | Define the basic router, agent, Text2Cypher, validation loop, and answer path. | Contract review. |
 | A1.2 | Implement Phases 1–3 | Implement the complete basic architecture. | Architecture tests pass. |
-| A1.3 | Run model candidates | After the shared runtime and benchmark runner are available, evaluate frontier Cypher models with the fixed conversational model. | One MLflow run per candidate. |
-| A1.4 | Select baseline model | Select the best general-purpose Cypher model for the eight-run comparison. | Human review of benchmark results; record the decision in `SESSION_SUMMARY.md`. |
+| A1.3 | Run model candidates | Evaluate frontier Cypher models with the fixed conversational model. | One MLflow run per candidate. |
+| A1.4 | Select baseline model | Select the best general-purpose Cypher model for the eight-run comparison. | Human review of benchmark results. |
 
 ## Architecture 2 — Generic Text2Cypher with Self-Reflection
 
@@ -206,6 +179,23 @@ router → agent → curated selection or Text2Cypher fallback
 | A4.1 | Create contract | Combine curated fallback and self-reflection contracts. | Contract review. |
 | A4.2 | Implement Phases 1–3 | Implement the fourth architecture under its own state and graph contract. | State and graph review. |
 | A4.3 | Verify combined behavior | Test curated success, fallback, reflection success, reflection failure, and bounded retry. | Architecture acceptance. |
+
+## Phase 4 — MLflow Integration
+
+MLflow runs beside Streamlit:
+
+```text
+Streamlit → http://localhost:8501
+MLflow    → http://localhost:5000
+```
+
+| # | Work Item | Description | Verification |
+|---|---|---|---|
+| 4.1 | MLflow configuration | Add configurable tracking URI, experiment name, run name, and artifact location. | Start MLflow and confirm connectivity. |
+| 4.2 | Flat configuration runs | Create one flat run per architecture/model configuration. | Inspect a run in the MLflow UI. |
+| 4.3 | Evaluation artifact | Log one artifact containing all 20 questions, expected answers, actual answers, structured output, scores, Cypher, validation, and errors. | Open the artifact and verify all questions. |
+| 4.4 | Raw structured-output logging | Log the actual JSON and any parse error without adding a separate scoring framework. | Confirm malformed output remains visible. |
+| 4.5 | Streamlit/MLflow startup | Document starting both applications and accessing both ports. | Verify both browser interfaces. |
 
 ## Phase 5 — Deterministic Evaluation
 
