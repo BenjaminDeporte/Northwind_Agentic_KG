@@ -167,6 +167,63 @@ def generate_answer(
     return answer.strip(), result if isinstance(result, dict) else None
 
 
+def reflect_answer(
+    question: str,
+    draft_answer: str,
+    query_result: dict[str, Any] | None,
+    *,
+    conversational_model: str,
+    model_client: ConversationalModelClient,
+    prompt_version: str = "generic-v1",
+) -> tuple[bool, str | None]:
+    """Ask the fixed conversational model whether a draft answers the question."""
+    response = model_client.complete(
+        model_name=conversational_model,
+        messages=[
+            {"role": "system", "content": (
+                "Review the draft answer against the question and supplied result. "
+                "Return JSON only: {\"satisfactory\": true|false, \"feedback\": string}. "
+                f"Prompt version: {prompt_version}."
+            )},
+            {"role": "user", "content": json.dumps({
+                "question": question, "draft_answer": draft_answer, "query_result": query_result
+            }, default=str)},
+        ],
+        temperature=0.0,
+        max_tokens=180,
+    )
+    parsed = _json_object(_text(response)) or {}
+    return bool(parsed.get("satisfactory")), parsed.get("feedback") if isinstance(parsed.get("feedback"), str) else None
+
+
+def select_curated_tool(
+    question: str,
+    *,
+    tools: list[dict[str, str]],
+    conversational_model: str,
+    model_client: ConversationalModelClient,
+    prompt_version: str = "generic-v1",
+) -> str | None:
+    """Let the conversational model select a named curated query or fallback."""
+    response = model_client.complete(
+        model_name=conversational_model,
+        messages=[
+            {"role": "system", "content": (
+                "Choose a curated graph query only when it directly matches the question. "
+                "Return JSON only with tool_name set to one listed name or null. "
+                f"Available tools: {json.dumps(tools)}. Prompt version: {prompt_version}."
+            )},
+            {"role": "user", "content": question},
+        ],
+        temperature=0.0,
+        max_tokens=120,
+    )
+    parsed = _json_object(_text(response)) or {}
+    selected = parsed.get("tool_name")
+    names = {tool["name"] for tool in tools}
+    return selected if selected in names else None
+
+
 class ConversationalTool:
     """Handler-shaped adapter for router and answer-generation methods."""
 
@@ -200,6 +257,12 @@ class ConversationalTool:
             prompt_version=prompt_version,
         )
 
+    def reflect_answer(self, question: str, draft_answer: str, query_result: dict[str, Any] | None, *, conversational_model: str, prompt_version: str) -> tuple[bool, str | None]:
+        return reflect_answer(question, draft_answer, query_result, conversational_model=conversational_model, model_client=self.model_client, prompt_version=prompt_version)
+
+    def select_curated_tool(self, question: str, *, tools: list[dict[str, str]], conversational_model: str, prompt_version: str) -> str | None:
+        return select_curated_tool(question, tools=tools, conversational_model=conversational_model, model_client=self.model_client, prompt_version=prompt_version)
+
 
 __all__ = [
     "ConversationalModelClient",
@@ -207,5 +270,7 @@ __all__ = [
     "build_answer_messages",
     "build_route_messages",
     "generate_answer",
+    "reflect_answer",
+    "select_curated_tool",
     "route_question",
 ]

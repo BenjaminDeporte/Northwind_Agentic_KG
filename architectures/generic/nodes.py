@@ -85,7 +85,7 @@ def validate_cypher_node(
     handlers: GenericHandlers,
     schema: str,
 ) -> dict[str, Any]:
-    generated = _latest_message(state, AIMessage, "text2cypher")
+    generated = _latest_message(state, AIMessage, "text2cypher") or _latest_message(state, AIMessage, "curated_query")
     if generated is None:
         raise ValueError("No Text2Cypher message is available for validation")
     query = str(generated.content)

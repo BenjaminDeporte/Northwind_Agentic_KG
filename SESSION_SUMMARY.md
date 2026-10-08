@@ -514,3 +514,35 @@ remote startup commands.
 
 Verification: Streamlit tests **2 passed**; full deterministic suite remains
 green after the shared-runtime integration.
+
+## Architectures 2–4 — graph implementations and LangGraph views (2026-10-08 13:45 CEST)
+
+Implemented the remaining architecture builders before the eight-run
+comparison:
+
+- Architecture 2, generic Text2Cypher with self-reflection, is implemented in
+  `architectures/generic_reflection/`. The reflection node emits a
+  `ToolMessage`, returns failed drafts to `agent`, and uses the existing loop
+  budget. See `PROJECT.md` and `GRAPH.md`.
+- Architecture 3, curated tools with Text2Cypher fallback, is implemented in
+  `architectures/curated/`. `CuratedQueryRegistry` contains typed benchmark
+  driven query entries; the conversational model selects a named query or the
+  graph falls back to Text2Cypher. Both paths pass the same validator and
+  Neo4j node. See `PROJECT.md` and `GRAPH.md`.
+- Architecture 4 combines Architecture 3 selection/fallback with Architecture
+  2 reflection in `architectures/curated_reflection/`. See `PROJECT.md` and
+  `GRAPH.md`.
+
+The runtime registry now builds all four architectures. The shared factory
+exposes reflection and curated selection handlers while keeping architecture
+state and topology local to each package. Added deterministic graph tests for
+all three new builders and updated runtime documentation.
+
+Verification: additional architecture tests **6 passed**; full deterministic
+suite **294 passed**.
+
+Generated JPG reference views alongside the Mermaid diagrams using
+`scripts/render_architecture_views.py`:
+`architectures/generic_reflection/GRAPH.jpg`,
+`architectures/curated/GRAPH.jpg`, and
+`architectures/curated_reflection/GRAPH.jpg`.

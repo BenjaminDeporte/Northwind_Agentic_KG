@@ -38,14 +38,15 @@ class ArchitectureRegistry:
 
 def default_architecture_registry() -> ArchitectureRegistry:
     from architectures.generic.graph import compile_graph
+    from architectures.generic_reflection.graph import compile_graph as compile_reflection
+    from architectures.curated.graph import compile_graph as compile_curated
+    from architectures.curated_reflection.graph import compile_graph as compile_curated_reflection
 
     registry = ArchitectureRegistry()
     registry.register("generic", compile_graph)
-    # Register the planned names so configuration errors are explicit rather
-    # than silently falling back to the generic graph.
-    registry.register("generic_reflection", None)
-    registry.register("curated", None)
-    registry.register("curated_reflection", None)
+    registry.register("generic_reflection", compile_reflection)
+    registry.register("curated", compile_curated)
+    registry.register("curated_reflection", compile_curated_reflection)
     return registry
 
 

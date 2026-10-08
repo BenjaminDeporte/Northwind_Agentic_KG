@@ -16,6 +16,7 @@ from common.runtime.architectures import ArchitectureRegistry, default_architect
 
 from architectures.generic.conversation import ConversationalTool
 from architectures.generic.text2cypher import generate_cypher
+from architectures.curated.tools import CuratedQueryRegistry
 
 
 class GenericRuntimeHandlers:
@@ -28,11 +29,13 @@ class GenericRuntimeHandlers:
         cypher_registry: CypherProviderRegistry,
         neo4j: Neo4jTool,
         schema: str,
+        curated_registry: CuratedQueryRegistry | None = None,
     ):
         self.conversational = conversational
         self.cypher_registry = cypher_registry
         self.neo4j = neo4j
         self.schema = schema
+        self.curated_registry = curated_registry or CuratedQueryRegistry.default()
 
     def route_question(self, question: str, *, conversational_model: str):
         return self.conversational.route_question(question, conversational_model=conversational_model)
@@ -86,6 +89,18 @@ class GenericRuntimeHandlers:
             conversational_model=conversational_model,
             prompt_version=prompt_version,
         )
+
+    def reflect_answer(self, question: str, draft_answer: str, query_result: dict[str, Any] | None, *, conversational_model: str, prompt_version: str) -> tuple[bool, str | None]:
+        return self.conversational.reflect_answer(question, draft_answer, query_result, conversational_model=conversational_model, prompt_version=prompt_version)
+
+    def curated_tools(self) -> list[dict[str, str]]:
+        return self.curated_registry.descriptions()
+
+    def select_curated_tool(self, question: str, *, conversational_model: str, prompt_version: str) -> str | None:
+        return self.conversational.select_curated_tool(question, tools=self.curated_tools(), conversational_model=conversational_model, prompt_version=prompt_version)
+
+    def curated_query(self, name: str) -> str:
+        return self.curated_registry.query(name)
 
 
 @dataclass(frozen=True)
@@ -152,6 +167,7 @@ def build_runtime(
         cypher_registry=resolved_cypher_registry,
         neo4j=neo4j,
         schema=schema,
+        curated_registry=CuratedQueryRegistry.default(),
     )
     graph = (registry or default_architecture_registry()).build(
         architecture,

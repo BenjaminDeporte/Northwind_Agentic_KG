@@ -24,11 +24,9 @@ def _settings():
     )
 
 
-def test_default_registry_exposes_all_planned_names_and_only_generic_is_buildable():
+def test_default_registry_exposes_all_four_builders_and_unknown_fails():
     registry = default_architecture_registry()
     assert registry.names() == ("curated", "curated_reflection", "generic", "generic_reflection")
-    with pytest.raises(NotImplementedError, match="curated"):
-        registry.build("curated")
     with pytest.raises(ValueError, match="Unknown architecture"):
         registry.build("missing")
 
