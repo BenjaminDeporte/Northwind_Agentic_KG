@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from architectures.generic.conversation import (
     ConversationalTool,
@@ -27,6 +28,14 @@ def test_router_uses_conversational_model_and_explicit_route():
 
 def test_invalid_router_json_has_safe_agent_fallback():
     client = FakeClient("not json")
+    assert route_question("How many customers?", conversational_model="m", model_client=client) == "agent"
+
+
+def test_router_reads_mistral_sdk_object_response_shape():
+    response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content='{"route":"agent"}'))]
+    )
+    client = FakeClient(response)
     assert route_question("How many customers?", conversational_model="m", model_client=client) == "agent"
 
 

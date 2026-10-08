@@ -50,5 +50,10 @@ class Neo4jTool:
             schema=self.schema,
         )
 
+    def explain(self, query: str, *, neo4j_client: Any = None) -> None:
+        """Run Neo4j's non-executing parse/plan preflight for one query."""
+        normalized = normalize_query(query)
+        _records(neo4j_client or self.client, f"EXPLAIN {normalized}")
+
 
 __all__ = ["Neo4jTool", "run_readonly_cypher"]

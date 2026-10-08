@@ -18,6 +18,8 @@ def _render_history(history: list[dict]) -> None:
                 st.markdown(message["content"])
                 if message.get("warning"):
                     st.warning(message["warning"])
+                if message.get("mlflow_url"):
+                    st.caption(f"[Open MLflow run]({message['mlflow_url']})")
 
 
 def render_chat_panel() -> None:
@@ -48,6 +50,7 @@ def render_chat_panel() -> None:
                 "role": "assistant",
                 "content": answer,
                 "warning": result.error,
+                "mlflow_url": getattr(result, "mlflow_url", None),
             })
         else:
             error = result.error or "The graph completed without returning an answer."

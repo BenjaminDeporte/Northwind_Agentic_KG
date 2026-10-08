@@ -302,3 +302,215 @@ service, checking `ollama list`, exercising the local API with a Cypher prompt,
 and recording hardware, model tag, and endpoint. Downstream Phase 4 items were
 renumbered to 4.4–4.9, and the default candidate metadata now identifies this
 model as an Ollama provider with no API key.
+
+**Phase 4.3 environment verification update (2026-10-08).** On `deel14`, the
+Ollama service responded successfully for the selected model when the request
+included `options.num_gpu=0`. The model returned valid Cypher (`MATCH (n)
+RETURN COUNT(n)`) in approximately 11.4 ms as reported by Ollama's nanosecond
+duration field. NVIDIA GPU initialization is
+currently blocked by a driver/library mismatch reported by `nvidia-smi`; CPU
+inference is therefore the working path until the host driver is repaired. The
+Ollama provider adapter in Phase 4.4 must support this runtime option, either per
+request or through service configuration. Phase 4.3 remains open for recording
+the Ollama version, installed model listing, hardware details, and final
+endpoint configuration.
+
+## Phase 4.4 to 4.6 — Provider registry, runtime factory, and architecture registration (2026-10-08)
+
+**4.4 — Cypher provider registry: complete.** Added
+`common/providers/ollama.py` and `common/providers/cypher.py`. The Ollama
+adapter calls `/api/chat`, uses non-streaming responses, passes the configured
+`num_gpu` option (currently `0` for CPU mode), and preserves the raw response.
+The registry selects Mistral or Ollama clients by exact model name and skips
+providers without an implemented adapter rather than silently substituting a
+different model. The Ollama response shape is now accepted by Text2Cypher.
+
+**4.5 — Runtime factory: complete.** Added `common/runtime/factory.py` with
+`AgentRuntime` and `build_runtime()`. It loads the configured schema and prompt,
+composes conversational, Cypher, validation, and Neo4j services into the
+Architecture 1 handler contract, and returns a compiled graph plus runtime
+metadata. Dependencies remain injectable for deterministic tests.
+
+**4.6 — Architecture registration: complete.** Added
+`common/runtime/architectures.py`. The registry exposes `generic`,
+`generic_reflection`, `curated`, and `curated_reflection`; only `generic` is
+currently buildable, while the planned architectures fail explicitly as
+unimplemented instead of silently falling back.
+
+Added provider and runtime tests covering Ollama request construction, CPU
+configuration, registry selection, duplicate/unknown models, runtime
+composition, and architecture errors. Verification: focused tests **18
+passed**; no live model or Neo4j call was made by the tests.
+
+## Phase 4.7 — Live smoke-test harness (2026-10-08)
+
+**4.7 — Live smoke-test harness: complete.** Added
+`scripts/run_smoke_test.py`. The script loads shared settings, builds the
+selected runtime, invokes one question through the compiled graph, and prints
+JSON containing the route, loop count, answer, structured result, generated
+Cypher, validation attempts, Neo4j result envelopes, and terminal error. It
+supports architecture and model overrides and works in the documented direct
+script form:
+
+```bash
+uv run python scripts/run_smoke_test.py --question "How many customers are there?"
+```
+
+The formatter is deterministic and does not create a second trace system or
+persist output; MLflow logging remains Phase 4.8. Verification: smoke-harness
+tests **2 passed**, CLI help works, Python compilation and `git diff --check`
+passed. No live model or Neo4j request was made from this environment.
+
+**4.7 live retest correction (2026-10-08).** The first live run reached the
+conversational provider but failed while parsing the Mistral SDK response:
+Mistral returns an object with `choices[0].message.content`. Extended the shared
+conversation parser to support that object shape and added a regression test.
+Focused tests passed, followed by the full deterministic suite: **285 passed**.
+The original smoke command can now be retried on `deel14`.
+
+**4.7 live query-validation correction (2026-10-08).** The first successful
+Ollama/Mistral smoke run generated three semantically valid queries, but Ollama
+returned literal `\\n` sequences. The validator therefore failed to recognize
+the `RETURN` clause and rejected all three before Neo4j; no value was returned
+because execution never started and `EXPLAIN` was never reached. Updated
+Text2Cypher cleanup to decode common escaped whitespace sequences and wired the
+runtime handler's validation through Neo4j `EXPLAIN` via `Neo4jTool.explain()`.
+Added regressions for escaped local-model output and the Ollama response shape.
+Full deterministic suite: **287 passed**. The smoke test should be rerun on
+`deel14`; its next result will distinguish validator failure, EXPLAIN failure,
+and query execution failure.
+
+**Live smoke-test acceptance update (2026-10-08).** The corrected smoke test
+returned the expected answer, structured result, valid Cypher, successful
+validation, and Neo4j count of 91. One run emitted a transient Neo4j Aura DNS
+resolution retry for the Bolt host; the driver recovered and the next three
+attempts completed without the warning. No application or query change was
+required.
+
+## Phase 4.8 and 4.9 — MLflow run service and runtime acceptance gate (2026-10-08 12:46 CEST)
+
+**4.8 — MLflow run service: complete.** Added `common/mlflow/service.py` and
+the package export. `MlflowRunService` configures the tracking URI and
+experiment, creates one flat run, logs safe runtime/model/prompt parameters,
+records compact run metrics, and stores the complete JSON-safe runtime result
+as `runtime_result.json`. The rendered schema prompt is stored separately as
+`prompts.json`, so the actual structured answer, Cypher attempts, validation
+envelopes, Neo4j results, and answer/error fields remain inspectable. The
+service accepts an injected MLflow module for deterministic tests and imports
+the real package lazily for live use. MLflow is now a normal uv dependency and
+`uv.lock` was updated.
+
+**4.9 — Runtime acceptance gate: complete.** Added
+`scripts/run_runtime_acceptance.py`. It builds the selected architecture with
+the shared factory, invokes one question using the smoke-test state and
+formatter, logs the completed result through MLflow, prints the run ID and
+experiment, and closes the Neo4j client. It supports architecture,
+conversational-model, Cypher-model, and run-name overrides. The local MLflow
+UI can be started with `uv run mlflow server --host 0.0.0.0 --port 5000`.
+
+Verification: focused MLflow/smoke tests **3 passed**; acceptance CLI help
+works; full deterministic suite remains **288 passed**. No live acceptance run
+was started here because it requires the configured Neo4j, model provider, and
+MLflow server.
+
+## Architecture 1 — A1.1 to A1.4 completion (2026-10-08)
+
+**A1.1 and A1.2 — contract and implementation: complete.** The Architecture 1
+contract and generic LangGraph implementation are present under
+`architectures/generic/`. The graph implements router, generic Text2Cypher,
+three-attempt validation/repair, read-only Neo4j execution, answer generation,
+and terminal handling. The shared runtime factory selects this architecture
+without importing archived code.
+
+**A1.3 — candidate sweep tooling: complete.** Added
+`common/evaluation/benchmark.py`, which loads all 20 canonical questions and
+provides a transparent first-pass score of `1` (expected answer appears), `0`
+(no answer), or `-1` (attempted but not matched). Added
+`scripts/run_architecture1_sweep.py`, which runs the generic architecture for
+each selected supported Cypher candidate and creates one flat MLflow run per
+candidate. Each run stores the question outputs, raw answers, structured
+results, and aggregate counts in `benchmark_result.json`; rendered prompts are
+stored in `prompts.json`.
+
+**A1.4 — baseline selection tooling: complete; model decision pending review.**
+Added `scripts/select_architecture1_baseline.py`, which applies the agreed
+score/accuracy/false-positive ordering to a reviewed sweep report. The script
+marks its output `review_required` because multi-row answers, refusals, and
+structured-output false negatives need human inspection. No model was selected
+automatically without completed candidate runs and review.
+
+Verification: new benchmark/model-selection tests **5 passed**; both CLI help
+commands work. Example commands:
+
+```bash
+uv run python scripts/run_architecture1_sweep.py \
+  --cypher-model "mistral-large-latest" \
+  --cypher-model "hf.co/mradermacher/text-to-cypher-Gemma-3-4B-Instruct-2025.04.0-GGUF:Q4_K_M"
+uv run python scripts/select_architecture1_baseline.py benchmark/architecture1_sweep.json
+```
+
+## Phase 5 — Deterministic evaluation (2026-10-08 13:28 CEST)
+
+**5.1 — Benchmark runner: complete.** The Architecture 1 sweep command runs
+all 20 canonical questions for one Cypher model configuration and writes the
+per-question outputs to one flat MLflow artifact. The existing completed sweep
+contains two runs: Mistral Large and the Ollama Gemma Text2Cypher candidate.
+
+**5.2 — Answer comparison: complete.** `score_answer` applies the agreed
+first-pass rule: normalize case and whitespace, then check whether the expected
+answer appears in the generated answer. Missing/blank answers receive `0`;
+matched answers receive `1`; other attempted answers receive `-1`. Raw answer
+text and structured output remain in the MLflow artifact for human review,
+especially for multi-value, refusal, and chitchat false negatives.
+
+**5.3 — Score aggregation: complete.** `aggregate_scores` computes
+`raw_score`, `accuracy_count`, `false_positive_count`, and `no_answer_count`,
+rejects scores outside `{-1, 0, 1}`, and verifies that the three counts sum to
+the question count.
+
+**5.4 — MLflow evaluation logging: complete.** Each configuration logs the
+aggregate metrics and complete `benchmark_result.json`, with `prompts.json`
+retained alongside it. The completed sweep currently reports:
+
+| Cypher model | Raw score | Accuracy | False positive | No answer |
+|---|---:|---:|---:|---:|
+| `mistral-large-latest` | 3 | 11 | 8 | 1 |
+| Ollama Gemma Text2Cypher | -5 | 7 | 12 | 1 |
+
+The deterministic selector currently proposes Mistral Large, but its output
+keeps `review_required: true`; this is a provisional result until the raw
+answers and structured outputs have been reviewed.
+
+Verification: full deterministic suite **291 passed**.
+
+## Phase 7 — Streamlit demonstration (2026-10-08)
+
+**7.1 — Architecture selector: complete.** Added a sidebar configuration
+panel with registered architecture and supported Cypher-model selectors. The
+fixed conversational model remains controlled by environment settings. The
+selected architecture and model are passed to the shared runtime factory and
+logged with each MLflow run. Unimplemented registered architectures remain
+visible but show a clear warning and fail explicitly if submitted.
+
+**7.2 — Chat execution: complete.** Reworked `src/streamlit/runtime.py` to
+use the architecture-agnostic runtime factory and the new `AgentState` rather
+than the archived graph. Runtime resources are cached per architecture/model
+selection. Each question starts a fresh graph state, displays the answer and
+structured result, and logs the complete runtime result to MLflow.
+
+**7.3 — MLflow run link: complete.** MLflow logging now exposes the experiment
+ID and the Streamlit chat history renders an `Open MLflow run` link for each
+completed answer. Logging failures remain visible as a warning while the
+generated answer remains available.
+
+**7.4 — Manual benchmark check: complete.** Added representative manual
+questions and the review procedure to `src/streamlit/README.md`. The linked
+MLflow `runtime_result.json` artifact is the comparison source for answer text,
+structured output, Cypher, validation, and Neo4j results.
+
+**7.5 — Remote SSH instructions: complete.** Documented simultaneous SSH
+forwarding for Streamlit port 8501 and MLflow port 5000, plus the corresponding
+remote startup commands.
+
+Verification: Streamlit tests **2 passed**; full deterministic suite remains
+green after the shared-runtime integration.

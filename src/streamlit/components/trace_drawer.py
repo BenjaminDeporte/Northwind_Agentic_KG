@@ -24,7 +24,18 @@ def render_trace_drawer(state: dict[str, Any] | None) -> None:
 
         trace = state.get("trace") or []
         if not trace:
-            st.caption("No tool calls in this run.")
+            messages = state.get("messages") or []
+            if messages:
+                st.caption(f"{len(messages)} workflow messages recorded; detailed execution is in MLflow.")
+                generated = [
+                    message.content
+                    for message in messages
+                    if getattr(message, "name", None) == "text2cypher"
+                ]
+                if generated:
+                    st.code(str(generated[-1]), language="cypher")
+            else:
+                st.caption("No tool calls in this run.")
         else:
             for record in trace:
                 step = record.get("step", "?")
@@ -58,3 +69,6 @@ def render_trace_drawer(state: dict[str, Any] | None) -> None:
         rationale = state.get("confidence_rationale") or "No confidence rationale was recorded."
         st.markdown("**Confidence rationale**")
         st.write(rationale)
+        if state.get("result") is not None:
+            st.markdown("**Structured result**")
+            st.json(state["result"])

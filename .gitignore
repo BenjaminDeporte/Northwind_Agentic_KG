@@ -72,6 +72,9 @@ venv.bak/
 *.log
 logs/
 
+# Local MLflow artifact store (serve it locally; do not commit generated data)
+mlartifacts/
+
 # OS files
 .DS_Store
 Thumbs.db

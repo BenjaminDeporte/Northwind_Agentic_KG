@@ -12,6 +12,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import streamlit as st
 
 from src.streamlit.components.chat import render_chat_panel
+from src.streamlit.components.configuration import render_configuration_panel
 from src.streamlit.components.trace_drawer import render_trace_drawer
 
 
@@ -22,7 +23,8 @@ st.set_page_config(
 )
 
 st.title("Northwind Agentic Knowledge Graph")
-st.caption("Ask questions about the Northwind graph and inspect the supporting evidence.")
+st.caption("Ask questions about the Northwind graph. Execution results are logged in MLflow.")
+render_configuration_panel()
 
 chat_column, trace_column, evidence_column = st.columns([3, 2, 2], gap="medium")
 
@@ -38,4 +40,9 @@ with trace_column:
 with evidence_column:
     st.subheader("Evidence Graph")
     with st.container(height=450, border=True, key="evidence_graph_scroll"):
-        st.info("The graph evidence for an answer will appear here.")
+        state = st.session_state.get("last_run_state")
+        result = state.get("result") if state else None
+        if result is None:
+            st.info("Structured graph results will appear here.")
+        else:
+            st.json(result)

@@ -65,6 +65,17 @@ def test_markdown_wrapped_model_output_is_cleaned():
     ) == "MATCH (n) RETURN n"
 
 
+def test_literal_escaped_newlines_from_local_models_are_normalized():
+    client = FakeModelClient(r"MATCH (n)\nRETURN count(n)")
+    tool = Text2CypherTool(client)
+    assert tool.generate_cypher(
+        "Count nodes",
+        schema_prompt="Schema",
+        model_name="neo4j-text2cypher",
+        prompt_version="v1",
+    ) == "MATCH (n)\nRETURN count(n)"
+
+
 def test_empty_model_output_is_rejected():
     client = FakeModelClient("  ")
     try:
@@ -79,4 +90,3 @@ def test_empty_model_output_is_rejected():
         assert "empty query" in str(exc)
     else:
         raise AssertionError("Expected an empty model response to fail")
-

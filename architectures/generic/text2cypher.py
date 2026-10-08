@@ -26,6 +26,9 @@ def _response_text(response: Any) -> str:
     if isinstance(response, dict):
         if isinstance(response.get("content"), str):
             return response["content"]
+        message = response.get("message") or {}
+        if isinstance(message, dict) and isinstance(message.get("content"), str):
+            return message["content"]
         choices = response.get("choices") or []
         if choices and isinstance(choices[0], dict):
             message = choices[0].get("message") or {}
@@ -51,6 +54,10 @@ def _clean_query(text: str) -> str:
         query = fenced.group(1).strip()
     if query.lower().startswith("cypher:"):
         query = query.split(":", 1)[1].strip()
+    # Some local chat runtimes emit escaped formatting characters as literal
+    # backslash sequences. Decode only the common whitespace escapes so clause
+    # detection sees ``RETURN`` as a real Cypher token.
+    query = query.replace("\\n", "\n").replace("\\r", "\r").replace("\\t", "\t")
     if not query:
         raise ValueError("The Cypher model returned an empty query")
     return query

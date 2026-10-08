@@ -57,6 +57,8 @@ class ModelSettings:
     cypher_provider: str = "mistral"
     cypher_api_key: str | None = field(default=None, repr=False)
     cypher_api_key_env: str | None = None
+    ollama_base_url: str = "http://127.0.0.1:11434"
+    ollama_num_gpu: int = 0
 
 
 @dataclass(frozen=True)
@@ -100,6 +102,8 @@ class AppSettings:
             "cypher_model": self.models.cypher_model,
             "cypher_provider": self.models.cypher_provider,
             "cypher_api_key_env": self.models.cypher_api_key_env,
+            "ollama_base_url": self.models.ollama_base_url,
+            "ollama_num_gpu": self.models.ollama_num_gpu,
             "prompt_version": self.prompt.version,
             "schema_path": str(self.prompt.schema_path),
             "mlflow_tracking_uri": self.mlflow.tracking_uri,
@@ -159,6 +163,8 @@ def load_settings(
             cypher_provider=_value(source, "CYPHER_PROVIDER", "mistral") or "mistral",
             cypher_api_key=_value(source, cypher_key_env or "MISTRAL_API_KEY"),
             cypher_api_key_env=cypher_key_env,
+            ollama_base_url=_value(source, "OLLAMA_BASE_URL", "http://127.0.0.1:11434") or "http://127.0.0.1:11434",
+            ollama_num_gpu=_int(source, "OLLAMA_NUM_GPU", 0),
         ),
         prompt=PromptSettings(
             version=_value(source, "PROMPT_VERSION", "generic-v1") or "generic-v1",

@@ -1,0 +1,24 @@
+[
+  {
+    "model": "mistral-large-latest",
+    "summary": {
+      "question_count": 20,
+      "raw_score": 3,
+      "accuracy_count": 11,
+      "false_positive_count": 8,
+      "no_answer_count": 1
+    },
+    "run_id": "d45fbf3c32d44c6993c94fb33f7a68dd"
+  },
+  {
+    "model": "hf.co/mradermacher/text-to-cypher-Gemma-3-4B-Instruct-2025.04.0-GGUF:Q4_K_M",
+    "summary": {
+      "question_count": 20,
+      "raw_score": -5,
+      "accuracy_count": 7,
+      "false_positive_count": 12,
+      "no_answer_count": 1
+    },
+    "run_id": "dad0df324fdd4b0e9952aa12d8976b07"
+  }
+]

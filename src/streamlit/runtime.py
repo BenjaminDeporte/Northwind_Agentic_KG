@@ -1,18 +1,10 @@
-"""Cached runtime resources and a per-question runner for the Streamlit app.
-
-Neo4j modules are intentionally imported inside the cached factory. The app can
-load its shell without requiring Neo4j credentials; the first caller creates
-and caches the driver, tool registry, and compiled LangGraph.
-"""
+"""Cached shared runtime and MLflow-backed question execution."""
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, NamedTuple
+from dataclasses import replace
+from typing import Any, NamedTuple
 
 import streamlit as st
-
-if TYPE_CHECKING:
-    from src.agents.state import AgentState
-
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +13,9 @@ class AgentRuntime(NamedTuple):
     """Resources shared by Streamlit reruns in this server process."""
 
     neo4j_client: Any
-    tools: dict[str, Callable[..., dict]]
     graph: Any
+    settings: Any
+    schema_prompt: str
 
 
 class QuestionRunResult(NamedTuple):
@@ -30,79 +23,61 @@ class QuestionRunResult(NamedTuple):
 
     state: dict[str, Any] | None
     error: str | None
+    mlflow_run_id: str | None = None
+    mlflow_url: str | None = None
 
 
 @st.cache_resource(show_spinner=False)
-def get_runtime() -> AgentRuntime:
-    """Create the Northwind runtime on first use, then reuse it across reruns."""
-    from src.agents.graph import compile_graph
-    from src.neo4j.client import client
-    from src.neo4j.tools import (
-        aggregate,
-        co_purchase,
-        customer_history,
-        impact_analysis,
-        lookup_entity,
-        run_readonly_cypher,
-    )
+def get_runtime(architecture: str = "generic", cypher_model: str | None = None) -> AgentRuntime:
+    """Create and cache one runtime per selected architecture/model pair."""
+    from common.config import load_settings
+    from common.runtime.factory import build_runtime
 
-    tools = {
-        "lookup_entity": lookup_entity,
-        "impact_analysis": impact_analysis,
-        "co_purchase": co_purchase,
-        "customer_history": customer_history,
-        "aggregate": aggregate,
-        "run_readonly_cypher": run_readonly_cypher,
-    }
-    return AgentRuntime(
-        neo4j_client=client,
-        tools=tools,
-        graph=compile_graph(tools),
-    )
+    settings = load_settings()
+    if cypher_model:
+        settings = replace(settings, models=replace(settings.models, cypher_model=cypher_model))
+    runtime = build_runtime(architecture=architecture, settings=settings)
+    return AgentRuntime(runtime.neo4j_client, runtime.graph, runtime.settings, runtime.schema_prompt)
 
 
 def run_question(question: str) -> QuestionRunResult:
-    """Run one question from a fresh state and append its completed run once."""
+    """Run one question from a fresh state and log the result to MLflow."""
     if not isinstance(question, str) or not question.strip():
         return QuestionRunResult(state=None, error="Enter a question to run the agent.")
 
-    initial_state: AgentState = {
-        "question": question.strip(),
-        "route": "",
-        "messages": [],
-        "trace": [],
-        "draft_answer": None,
-        "draft_citations": [],
-        "consistency_status": "pending",
-        "consistency_feedback": None,
-        "answer": "",
-        "citations": [],
-        "confidence": 0.0,
-        "confidence_rationale": "",
-        "loop_count": 0,
-        "error": None,
-    }
+    from scripts.run_smoke_test import initial_state, summarize_state
+    from src.streamlit.components.configuration import CONFIG_KEY
 
+    configuration = st.session_state.get(CONFIG_KEY, {"architecture": "generic", "cypher_model": None})
+    initial: dict[str, Any] = initial_state(question.strip())
     try:
-        runtime = get_runtime()
-        final_state = runtime.graph.invoke(initial_state)
+        runtime = get_runtime(configuration["architecture"], configuration.get("cypher_model"))
+        final_state = runtime.graph.invoke(initial)
     except Exception as exc:
         logger.exception("Northwind graph invocation failed")
-        if isinstance(exc, ValueError) and "must be set" in str(exc):
-            error = str(exc)
-        else:
-            error = "The agent could not complete this question. Check the Streamlit server log for details."
-        return QuestionRunResult(state=None, error=error)
+        return QuestionRunResult(state=None, error=str(exc))
 
+    mlflow_run_id = None
+    mlflow_url = None
     try:
-        from src.utils.runlog import write_run
+        from common.mlflow import MlflowRunService
 
-        write_run(final_state)
-    except Exception:
-        logger.exception("Northwind graph completed, but its run could not be logged")
-        return QuestionRunResult(
-            state=final_state,
-            error="The answer was generated, but the run could not be saved to the run log.",
+        logged = MlflowRunService(runtime.settings.mlflow).log_result(
+            runtime_metadata=runtime.settings.public_metadata() | {
+                "architecture": configuration["architecture"],
+                "cypher_model": configuration.get("cypher_model") or runtime.settings.models.cypher_model,
+            },
+            result=summarize_state(final_state),
+            prompts={"schema_prompt": runtime.schema_prompt},
+            run_name=f"streamlit-{configuration['architecture']}",
+            tags={"source": "streamlit", "architecture": configuration["architecture"]},
         )
+        mlflow_run_id = logged.run_id
+        if logged.run_id:
+            experiment_id = logged.experiment_id or "0"
+            mlflow_url = f"{runtime.settings.mlflow.tracking_uri.rstrip('/')}/#/experiments/{experiment_id}/runs/{logged.run_id}"
+    except Exception as exc:
+        logger.exception("Question completed, but MLflow logging failed")
+        return QuestionRunResult(state=final_state, error=f"MLflow logging failed: {exc}")
 
-    return QuestionRunResult(state=final_state, error=None)
+    return QuestionRunResult(state=final_state, error=None, mlflow_run_id=mlflow_run_id, mlflow_url=mlflow_url)

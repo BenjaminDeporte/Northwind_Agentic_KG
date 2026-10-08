@@ -34,6 +34,12 @@ def _text(response: Any) -> str:
     content = getattr(response, "content", None)
     if isinstance(content, str):
         return content
+    choices = getattr(response, "choices", None) or []
+    if choices:
+        message = getattr(choices[0], "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content
     raise TypeError("The conversational model response did not contain text content")
 
 
