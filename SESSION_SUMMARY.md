@@ -257,3 +257,48 @@ immediately after the common Phase 3 table and before Architecture 1–4. This i
 the actual dependency order: shared settings, provider adapters, runtime
 factory, smoke harness, and MLflow must exist before architecture-specific live
 runs or model sweeps.
+
+## Phase 4.1 — Shared settings loader (2026-10-08)
+
+**4.1 — Shared settings loader: complete.** Added
+`common/config/settings.py` and exported its typed settings classes through
+`common.config`. `load_settings()` reads `.env` with process environment
+precedence, supports injected mappings for deterministic tests, and covers
+Neo4j, conversational/Cypher model roles and key selectors, prompt/schema
+versioning, Streamlit, MLflow, application metadata, and logging. Secret values
+are excluded from dataclass representations and `public_metadata()`; the
+loader does not print credentials. Added `.env.example` entries for the new
+runtime roles and MLflow settings.
+
+Verification: the real `.env` loaded successfully without exposing credentials;
+`uv run --no-sync pytest -q -o addopts=''` — **270 passed**. No Neo4j, model, or
+MLflow calls were made. Next: Phase 4.2, the conversational provider adapter.
+
+## Phase 4.2 — Conversational provider adapter (2026-10-08)
+
+**4.2 — Conversational provider adapter: complete.** Added
+`common/providers/mistral.py` and its package export. `MistralChatClient`
+implements the provider-neutral conversational client protocol used by the
+Architecture 1 router and answer generator, passes the configured model name,
+messages, temperature, and token limit to `client.chat.complete`, and returns
+the raw SDK response unchanged. `build_mistral_client()` consumes the Phase
+4.1 settings object and rejects a non-Mistral conversational provider. The SDK
+import and client construction are lazy, so deterministic tests do not contact
+Mistral or require a live client.
+
+Added five provider tests covering request mapping, key requirements, settings
+integration, provider mismatch, and invalid request parameters. Verification:
+focused provider/configuration/conversation tests **17 passed**; no live model
+request was made. Next: Phase 4.3, manual Ollama/Gemma runtime preparation.
+
+## Plan amendment — Phase 4.3 Ollama preparation (2026-10-08)
+
+Added a dedicated Phase 4.3 item to `PLAN_REDESIGN.md` for manual Ollama
+preparation before the Cypher provider registry. The approved candidate is the
+quantized Neo4j Gemma 3 4B model:
+`hf.co/mradermacher/text-to-cypher-Gemma-3-4B-Instruct-2025.04.0-GGUF:Q4_K_M`.
+The item covers installing Ollama, downloading the model, starting the local
+service, checking `ollama list`, exercising the local API with a Cypher prompt,
+and recording hardware, model tag, and endpoint. Downstream Phase 4 items were
+renumbered to 4.4–4.9, and the default candidate metadata now identifies this
+model as an Ollama provider with no API key.

@@ -12,3 +12,13 @@ Expected settings include:
 - Streamlit and MLflow URLs.
 
 Architecture code reads configuration through this boundary rather than directly reading environment variables.
+
+The implementation is `settings.py`. Call `load_settings()` once at runtime;
+environment variables override values from `.env`. Neo4j and model credentials
+are kept in typed settings objects with secret fields excluded from `repr` and
+`public_metadata()`. Tests can inject an environment mapping without loading
+the developer's `.env` file.
+
+The Mistral adapter in `common/providers/mistral.py` consumes the configured
+conversational API key and returns the SDK response unchanged for later
+structured-output parsing and MLflow logging.

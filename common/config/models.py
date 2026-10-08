@@ -17,7 +17,12 @@ DEFAULT_CYPHER_CANDIDATES: tuple[CypherModelCandidate, ...] = (
     CypherModelCandidate("mistral-large-latest", "mistral", "MISTRAL_API_KEY"),
     CypherModelCandidate("gpt-5", "openai", "OPENAI_API_KEY"),
     CypherModelCandidate("claude-sonnet", "anthropic", "ANTHROPIC_API_KEY"),
-    CypherModelCandidate("neo4j/text2cypher", "huggingface", "HF_TOKEN", "Neo4j fine-tuned candidate"),
+    CypherModelCandidate(
+        "hf.co/mradermacher/text-to-cypher-Gemma-3-4B-Instruct-2025.04.0-GGUF:Q4_K_M",
+        "ollama",
+        None,
+        "Neo4j Gemma 3 4B quantized Text2Cypher candidate",
+    ),
 )
 
 
