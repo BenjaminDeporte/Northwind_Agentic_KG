@@ -110,6 +110,26 @@ Stretch items (in order):
 
 See [PROJECT.md](PROJECT.md) for detailed project description and [docs/northwind_plan.md](docs/northwind_plan.md) for the execution plan with gates.
 
+## Start Streamlit and MLflow
+
+From the repository root, start MLflow and Streamlit in separate terminals:
+
+```bash
+uv run mlflow server --host 0.0.0.0 --port 5000
+uv run streamlit run src/streamlit/app.py --server.address 0.0.0.0 --server.port 8501
+```
+
+When working on a remote server, forward both ports to your local machine:
+
+```bash
+ssh -N \
+  -L 8501:127.0.0.1:8501 \
+  -L 5000:127.0.0.1:5000 \
+  user@remote-host
+```
+
+Then open Streamlit at `http://localhost:8501` and MLflow at `http://localhost:5000`.
+
 ## License
 
 MIT License
